@@ -4,6 +4,9 @@ export declare class Joiner {
     static join(left: DataFrame, right: DataFrame, on: string | string[], how?: JoinType, suffixes?: [string, string]): DataFrame;
     private static validateJoinKeys;
     private static buildHashIndex;
+    /**
+     * Create a simple string key for a row using '||' separator.
+     */
     private static createJoinKey;
     private static innerJoin;
     private static leftJoin;

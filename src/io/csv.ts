@@ -17,7 +17,12 @@ export class CsvReader {
       inferTypes = true
     } = options;
 
-    const lines = csvString.trim().split('\n').slice(skipRows);
+    const trimmed = csvString.trim();
+    if (trimmed === '') {
+      return new DataFrame({});
+    }
+    
+    const lines = trimmed.split('\n').slice(skipRows);
     if (lines.length === 0) {
       return new DataFrame({});
     }

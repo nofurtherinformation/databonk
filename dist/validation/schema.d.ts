@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { DataFrame } from '../core/dataframe.js';
 export type SchemaDefinition = z.ZodRawShape;
-export type DataFrameSchema<T extends SchemaDefinition = SchemaDefinition> = z.ZodObject<T>;
+export type DataFrameSchema<T extends SchemaDefinition = SchemaDefinition> = z.ZodObject<T> | z.ZodTypeAny;
 export interface ValidationResult {
     success: boolean;
     errors: ValidationError[];
@@ -16,10 +16,10 @@ export interface ValidationError {
 }
 export declare class SchemaValidator {
     static define<T extends SchemaDefinition>(shape: T): DataFrameSchema<T>;
-    static validate<T extends SchemaDefinition>(df: DataFrame, schema: DataFrameSchema<T>, options?: ValidationOptions): ValidationResult;
-    static validateAndTransform<T extends SchemaDefinition>(df: DataFrame, schema: DataFrameSchema<T>): DataFrame;
-    static filterValid<T extends SchemaDefinition>(df: DataFrame, schema: DataFrameSchema<T>): DataFrame;
-    static getInvalid<T extends SchemaDefinition>(df: DataFrame, schema: DataFrameSchema<T>): DataFrame;
+    static validate(df: DataFrame, schema: DataFrameSchema | z.ZodTypeAny, options?: ValidationOptions): ValidationResult;
+    static validateAndTransform(df: DataFrame, schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
+    static filterValid(df: DataFrame, schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
+    static getInvalid(df: DataFrame, schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
 }
 export interface ValidationOptions {
     stopOnFirst?: boolean;
@@ -64,10 +64,10 @@ export declare const CommonSchemas: {
 };
 declare module '../core/dataframe.js' {
     interface DataFrame {
-        validate<T extends SchemaDefinition>(schema: DataFrameSchema<T>, options?: ValidationOptions): ValidationResult;
-        validateAndTransform<T extends SchemaDefinition>(schema: DataFrameSchema<T>): DataFrame;
-        filterValid<T extends SchemaDefinition>(schema: DataFrameSchema<T>): DataFrame;
-        getInvalid<T extends SchemaDefinition>(schema: DataFrameSchema<T>): DataFrame;
+        validate(schema: DataFrameSchema | z.ZodTypeAny, options?: ValidationOptions): ValidationResult;
+        validateAndTransform(schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
+        filterValid(schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
+        getInvalid(schema: DataFrameSchema | z.ZodTypeAny): DataFrame;
     }
 }
 //# sourceMappingURL=schema.d.ts.map

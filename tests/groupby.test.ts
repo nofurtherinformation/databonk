@@ -72,7 +72,7 @@ describe('GroupBy Operations', () => {
       const result = df.groupBy(['region']).sum(['quantity']);
       
       const northRow = result.filter(row => row.region === 'North').getRow(0);
-      expect(northRow.quantity).toBe(270); // 100 + 150 + 50 + 120
+      expect(northRow.quantity).toBe(420); // 100 + 150 + 50 + 120
     });
 
     test('mean method', () => {

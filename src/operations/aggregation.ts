@@ -125,7 +125,7 @@ DataFrame.prototype.sum = function(columns?: string[]): DataFrame {
   
   const spec: AggregateSpec = {};
   cols.forEach(col => {
-    spec[`${col}_sum`] = col;
+    spec[col] = ['sum'];
   });
   
   return Aggregator.agg(this, spec);
@@ -139,7 +139,7 @@ DataFrame.prototype.mean = function(columns?: string[]): DataFrame {
   
   const spec: AggregateSpec = {};
   cols.forEach(col => {
-    spec[`${col}_mean`] = col;
+    spec[col] = ['mean'];
   });
   
   return Aggregator.agg(this, spec);
@@ -149,7 +149,7 @@ DataFrame.prototype.count = function(columns?: string[]): DataFrame {
   const cols = columns || this.columnNames;
   const spec: AggregateSpec = {};
   cols.forEach(col => {
-    spec[`${col}_count`] = col;
+    spec[col] = ['count'];
   });
   
   return Aggregator.agg(this, spec);
@@ -163,7 +163,7 @@ DataFrame.prototype.min = function(columns?: string[]): DataFrame {
   
   const spec: AggregateSpec = {};
   cols.forEach(col => {
-    spec[`${col}_min`] = col;
+    spec[col] = ['min'];
   });
   
   return Aggregator.agg(this, spec);
@@ -177,7 +177,7 @@ DataFrame.prototype.max = function(columns?: string[]): DataFrame {
   
   const spec: AggregateSpec = {};
   cols.forEach(col => {
-    spec[`${col}_max`] = col;
+    spec[col] = ['max'];
   });
   
   return Aggregator.agg(this, spec);

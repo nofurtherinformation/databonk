@@ -1,5 +1,6 @@
 import { DataFrame, RowObject } from '../core/dataframe.js';
 import { Column } from '../core/column.js';
+import { globalIndexCache } from '../core/index-cache.js';
 
 export type JoinType = 'inner' | 'left' | 'right' | 'outer';
 
@@ -12,12 +13,12 @@ export class Joiner {
     suffixes: [string, string] = ['_x', '_y']
   ): DataFrame {
     const joinKeys = Array.isArray(on) ? on : [on];
-    
+
     this.validateJoinKeys(left, right, joinKeys);
-    
+
     const leftIndex = this.buildHashIndex(left, joinKeys);
     const rightIndex = this.buildHashIndex(right, joinKeys);
-    
+
     switch (how) {
       case 'inner':
         return this.innerJoin(left, right, leftIndex, rightIndex, joinKeys, suffixes);
@@ -43,27 +44,57 @@ export class Joiner {
     });
   }
 
-  private static buildHashIndex(df: DataFrame, keys: string[]): Map<string, number[]> {
-    const index = new Map<string, number[]>();
-    
-    for (let i = 0; i < df.length; i++) {
-      const keyValue = this.createJoinKey(df, i, keys);
-      if (!index.has(keyValue)) {
-        index.set(keyValue, []);
+  private static buildHashIndex(
+    df: DataFrame,
+    keys: string[],
+    useCache: boolean = true
+  ): Map<string, number[]> {
+    // Check cache first
+    if (useCache) {
+      const cached = globalIndexCache.getIndex(df, keys);
+      if (cached) {
+        return cached;
       }
-      index.get(keyValue)!.push(i);
     }
-    
+
+    const index = new Map<string, number[]>();
+
+    // Cache column references once before the loop
+    const columns = keys.map(k => df.column(k));
+
+    for (let i = 0; i < df.length; i++) {
+      const key = this.createJoinKey(columns, i);
+
+      const indices = index.get(key);
+      if (indices) {
+        indices.push(i);
+      } else {
+        index.set(key, [i]);
+      }
+    }
+
+    // Store in cache
+    if (useCache) {
+      globalIndexCache.setIndex(df, keys, index);
+    }
+
     return index;
   }
 
-  private static createJoinKey(df: DataFrame, rowIndex: number, keys: string[]): string {
-    const keyParts = keys.map(key => {
-      const column = df.column(key);
-      const value = column.get(rowIndex);
-      return value === null ? '__NULL__' : String(value);
-    });
-    return keyParts.join('||');
+  /**
+   * Create a simple string key for a row using '||' separator.
+   */
+  private static createJoinKey(
+    columns: Column[],
+    rowIndex: number
+  ): string {
+    let key = '';
+    for (let i = 0; i < columns.length; i++) {
+      if (i > 0) key += '||';
+      const val = columns[i].get(rowIndex);
+      key += val === null ? '\0' : String(val);
+    }
+    return key;
   }
 
   private static innerJoin(
@@ -75,18 +106,34 @@ export class Joiner {
     suffixes: [string, string]
   ): DataFrame {
     const matches: Array<[number, number]> = [];
-    
-    for (const [key, leftIndices] of leftIndex) {
+
+    // Cache column references for key lookups
+    const leftColumns = joinKeys.map(k => left.column(k));
+
+    // Track which left rows have been processed to avoid duplicates
+    const processedLeft = new Set<number>();
+
+    // Iterate through left rows in original order
+    for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+      if (processedLeft.has(leftIdx)) continue;
+
+      const key = this.createJoinKey(leftColumns, leftIdx);
+
       const rightIndices = rightIndex.get(key);
       if (rightIndices) {
-        for (const leftIdx of leftIndices) {
-          for (const rightIdx of rightIndices) {
-            matches.push([leftIdx, rightIdx]);
+        // Get all left rows with the same key
+        const leftIndices = leftIndex.get(key);
+        if (leftIndices) {
+          for (const lIdx of leftIndices) {
+            processedLeft.add(lIdx);
+            for (const rightIdx of rightIndices) {
+              matches.push([lIdx, rightIdx]);
+            }
           }
         }
       }
     }
-    
+
     return this.buildJoinedDataFrame(left, right, matches, joinKeys, suffixes);
   }
 
@@ -99,22 +146,33 @@ export class Joiner {
     suffixes: [string, string]
   ): DataFrame {
     const matches: Array<[number, number | null]> = [];
-    
-    for (const [key, leftIndices] of leftIndex) {
+
+    const leftColumns = joinKeys.map(k => left.column(k));
+    const processedLeft = new Set<number>();
+
+    // Iterate through left rows in original order
+    for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+      if (processedLeft.has(leftIdx)) continue;
+
+      const key = this.createJoinKey(leftColumns, leftIdx);
+
       const rightIndices = rightIndex.get(key);
-      if (rightIndices) {
-        for (const leftIdx of leftIndices) {
-          for (const rightIdx of rightIndices) {
-            matches.push([leftIdx, rightIdx]);
+      const leftIndices = leftIndex.get(key);
+
+      if (leftIndices) {
+        for (const lIdx of leftIndices) {
+          processedLeft.add(lIdx);
+          if (rightIndices) {
+            for (const rightIdx of rightIndices) {
+              matches.push([lIdx, rightIdx]);
+            }
+          } else {
+            matches.push([lIdx, null]);
           }
-        }
-      } else {
-        for (const leftIdx of leftIndices) {
-          matches.push([leftIdx, null]);
         }
       }
     }
-    
+
     return this.buildJoinedDataFrame(left, right, matches, joinKeys, suffixes);
   }
 
@@ -127,22 +185,33 @@ export class Joiner {
     suffixes: [string, string]
   ): DataFrame {
     const matches: Array<[number | null, number]> = [];
-    
-    for (const [key, rightIndices] of rightIndex) {
+
+    const rightColumns = joinKeys.map(k => right.column(k));
+    const processedRight = new Set<number>();
+
+    // Iterate through right rows in original order
+    for (let rightIdx = 0; rightIdx < right.length; rightIdx++) {
+      if (processedRight.has(rightIdx)) continue;
+
+      const key = this.createJoinKey(rightColumns, rightIdx);
+
       const leftIndices = leftIndex.get(key);
-      if (leftIndices) {
-        for (const rightIdx of rightIndices) {
-          for (const leftIdx of leftIndices) {
-            matches.push([leftIdx, rightIdx]);
+      const rightIndices = rightIndex.get(key);
+
+      if (rightIndices) {
+        for (const rIdx of rightIndices) {
+          processedRight.add(rIdx);
+          if (leftIndices) {
+            for (const leftIdx of leftIndices) {
+              matches.push([leftIdx, rIdx]);
+            }
+          } else {
+            matches.push([null, rIdx]);
           }
-        }
-      } else {
-        for (const rightIdx of rightIndices) {
-          matches.push([null, rightIdx]);
         }
       }
     }
-    
+
     return this.buildJoinedDataFrame(left, right, matches, joinKeys, suffixes);
   }
 
@@ -156,31 +225,45 @@ export class Joiner {
   ): DataFrame {
     const matches: Array<[number | null, number | null]> = [];
     const processedRightKeys = new Set<string>();
-    
-    for (const [key, leftIndices] of leftIndex) {
+    const processedLeft = new Set<number>();
+
+    const leftColumns = joinKeys.map(k => left.column(k));
+    const rightColumns = joinKeys.map(k => right.column(k));
+
+    // Process left side first (in original order)
+    for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+      if (processedLeft.has(leftIdx)) continue;
+
+      const key = this.createJoinKey(leftColumns, leftIdx);
+
       const rightIndices = rightIndex.get(key);
-      if (rightIndices) {
-        processedRightKeys.add(key);
-        for (const leftIdx of leftIndices) {
-          for (const rightIdx of rightIndices) {
-            matches.push([leftIdx, rightIdx]);
+      const leftIndices = leftIndex.get(key);
+
+      if (leftIndices) {
+        for (const lIdx of leftIndices) {
+          processedLeft.add(lIdx);
+          if (rightIndices) {
+            processedRightKeys.add(key);
+            for (const rightIdx of rightIndices) {
+              matches.push([lIdx, rightIdx]);
+            }
+          } else {
+            matches.push([lIdx, null]);
           }
         }
-      } else {
-        for (const leftIdx of leftIndices) {
-          matches.push([leftIdx, null]);
-        }
       }
     }
-    
-    for (const [key, rightIndices] of rightIndex) {
+
+    // Add unmatched right rows (in original order)
+    for (let rightIdx = 0; rightIdx < right.length; rightIdx++) {
+      const key = this.createJoinKey(rightColumns, rightIdx);
+
       if (!processedRightKeys.has(key)) {
-        for (const rightIdx of rightIndices) {
-          matches.push([null, rightIdx]);
-        }
+        matches.push([null, rightIdx]);
+        processedRightKeys.add(key);  // Mark this key as processed
       }
     }
-    
+
     return this.buildJoinedDataFrame(left, right, matches, joinKeys, suffixes);
   }
 
@@ -193,14 +276,14 @@ export class Joiner {
   ): DataFrame {
     const resultColumns: Record<string, Column> = {};
     const resultLength = matches.length;
-    
+
     const leftColumns = left.columnNames;
     const rightColumns = right.columnNames.filter(name => !joinKeys.includes(name));
-    
+
     leftColumns.forEach(colName => {
       const values: any[] = [];
       const leftCol = left.column(colName);
-      
+
       for (const [leftIdx, rightIdx] of matches) {
         if (leftIdx !== null) {
           values.push(leftCol.get(leftIdx));
@@ -208,15 +291,15 @@ export class Joiner {
           values.push(null);
         }
       }
-      
+
       const finalName = rightColumns.includes(colName) ? colName + suffixes[0] : colName;
       resultColumns[finalName] = new Column(finalName, values, leftCol.dataType);
     });
-    
+
     rightColumns.forEach(colName => {
       const values: any[] = [];
       const rightCol = right.column(colName);
-      
+
       for (const [leftIdx, rightIdx] of matches) {
         if (rightIdx !== null) {
           values.push(rightCol.get(rightIdx));
@@ -224,11 +307,11 @@ export class Joiner {
           values.push(null);
         }
       }
-      
+
       const finalName = leftColumns.includes(colName) ? colName + suffixes[1] : colName;
       resultColumns[finalName] = new Column(finalName, values, rightCol.dataType);
     });
-    
+
     return new DataFrame(resultColumns);
   }
 }

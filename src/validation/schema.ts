@@ -4,7 +4,7 @@ import { Column } from '../core/column.js';
 import { DataType } from '../utils/types.js';
 
 export type SchemaDefinition = z.ZodRawShape;
-export type DataFrameSchema<T extends SchemaDefinition = SchemaDefinition> = z.ZodObject<T>;
+export type DataFrameSchema<T extends SchemaDefinition = SchemaDefinition> = z.ZodObject<T> | z.ZodTypeAny;
 
 export interface ValidationResult {
   success: boolean;
@@ -25,9 +25,9 @@ export class SchemaValidator {
     return z.object(shape);
   }
 
-  static validate<T extends SchemaDefinition>(
+  static validate(
     df: DataFrame,
-    schema: DataFrameSchema<T>,
+    schema: DataFrameSchema | z.ZodTypeAny,
     options: ValidationOptions = {}
   ): ValidationResult {
     const { stopOnFirst = false, coerce = false } = options;
@@ -38,12 +38,43 @@ export class SchemaValidator {
       const row = df.getRow(i);
       
       try {
-        if (coerce) {
-          schema.parse(row);
-        } else {
-          schema.strict().parse(row);
+        let rowToValidate = row;
+        
+        // Try parsing with original row first (preserves null for nullable fields)
+        try {
+          if (coerce) {
+            schema.parse(row);
+          } else {
+            schema.parse(row);
+          }
+          validRows++;
+          continue;
+        } catch (firstError) {
+          // If parsing fails with null-related error, try normalizing null to undefined
+          // This handles optional fields that don't accept null
+          if (firstError instanceof z.ZodError) {
+            const hasNullError = firstError.issues.some(issue => 
+              issue.message.includes('null') && 
+              (issue.code === 'invalid_type' || issue.message.includes('Expected'))
+            );
+            
+            if (hasNullError) {
+              // Normalize null to undefined for optional fields (recursively for nested objects)
+              rowToValidate = normalizeNullToUndefined(row) as RowObject;
+              
+              // Retry with normalized row
+              if (coerce) {
+                schema.parse(rowToValidate);
+              } else {
+                schema.parse(rowToValidate);
+              }
+              validRows++;
+              continue;
+            }
+          }
+          // Re-throw if normalization didn't help
+          throw firstError;
         }
-        validRows++;
       } catch (error) {
         if (error instanceof z.ZodError) {
           for (const issue of error.issues) {
@@ -68,16 +99,35 @@ export class SchemaValidator {
     };
   }
 
-  static validateAndTransform<T extends SchemaDefinition>(
+  static validateAndTransform(
     df: DataFrame,
-    schema: DataFrameSchema<T>
+    schema: DataFrameSchema | z.ZodTypeAny
   ): DataFrame {
     const transformedRows: RowObject[] = [];
     
     for (let i = 0; i < df.length; i++) {
       const row = df.getRow(i);
+      let rowToValidate = row;
+      
       try {
-        const validatedRow = schema.parse(row);
+        // Try with original row first
+        schema.parse(row);
+      } catch (firstError) {
+        // If parsing fails with null-related error, try normalizing
+        if (firstError instanceof z.ZodError) {
+          const hasNullError = firstError.issues.some(issue => 
+            issue.message.includes('null') && 
+            (issue.code === 'invalid_type' || issue.message.includes('Expected'))
+          );
+          
+          if (hasNullError) {
+            rowToValidate = normalizeNullToUndefined(row) as RowObject;
+          }
+        }
+      }
+      
+      try {
+        const validatedRow = schema.parse(rowToValidate);
         transformedRows.push(validatedRow);
       } catch (error) {
         throw new Error(`Validation failed at row ${i}: ${error}`);
@@ -87,17 +137,36 @@ export class SchemaValidator {
     return DataFrame.fromRows(transformedRows);
   }
 
-  static filterValid<T extends SchemaDefinition>(
+  static filterValid(
     df: DataFrame,
-    schema: DataFrameSchema<T>
+    schema: DataFrameSchema | z.ZodTypeAny
   ): DataFrame {
     const validRows: RowObject[] = [];
     
     for (let i = 0; i < df.length; i++) {
       const row = df.getRow(i);
+      let rowToValidate = row;
+      
       try {
+        // Try with original row first
         schema.parse(row);
-        validRows.push(row);
+      } catch (firstError) {
+        // If parsing fails with null-related error, try normalizing
+        if (firstError instanceof z.ZodError) {
+          const hasNullError = firstError.issues.some(issue => 
+            issue.message.includes('null') && 
+            (issue.code === 'invalid_type' || issue.message.includes('Expected'))
+          );
+          
+          if (hasNullError) {
+            rowToValidate = normalizeNullToUndefined(row) as RowObject;
+          }
+        }
+      }
+      
+      try {
+        schema.parse(rowToValidate);
+        validRows.push(row); // Keep original row with null values
       } catch (error) {
         // Skip invalid rows
       }
@@ -106,16 +175,35 @@ export class SchemaValidator {
     return DataFrame.fromRows(validRows);
   }
 
-  static getInvalid<T extends SchemaDefinition>(
+  static getInvalid(
     df: DataFrame,
-    schema: DataFrameSchema<T>
+    schema: DataFrameSchema | z.ZodTypeAny
   ): DataFrame {
     const invalidIndices: number[] = [];
     
     for (let i = 0; i < df.length; i++) {
       const row = df.getRow(i);
+      let rowToValidate = row;
+      
       try {
+        // Try with original row first
         schema.parse(row);
+      } catch (firstError) {
+        // If parsing fails with null-related error, try normalizing
+        if (firstError instanceof z.ZodError) {
+          const hasNullError = firstError.issues.some(issue => 
+            issue.message.includes('null') && 
+            (issue.code === 'invalid_type' || issue.message.includes('Expected'))
+          );
+          
+          if (hasNullError) {
+            rowToValidate = normalizeNullToUndefined(row) as RowObject;
+          }
+        }
+      }
+      
+      try {
+        schema.parse(rowToValidate);
       } catch (error) {
         invalidIndices.push(i);
       }
@@ -128,6 +216,22 @@ export class SchemaValidator {
 export interface ValidationOptions {
   stopOnFirst?: boolean;
   coerce?: boolean;
+}
+
+// Recursively normalize null to undefined for optional fields
+function normalizeNullToUndefined(value: any): any {
+  if (value === null) {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeNullToUndefined);
+  }
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, val]) => [key, normalizeNullToUndefined(val)])
+    );
+  }
+  return value;
 }
 
 // Common schema builders
@@ -210,46 +314,46 @@ export const CommonSchemas = {
 
 declare module '../core/dataframe.js' {
   interface DataFrame {
-    validate<T extends SchemaDefinition>(
-      schema: DataFrameSchema<T>,
+    validate(
+      schema: DataFrameSchema | z.ZodTypeAny,
       options?: ValidationOptions
     ): ValidationResult;
     
-    validateAndTransform<T extends SchemaDefinition>(
-      schema: DataFrameSchema<T>
+    validateAndTransform(
+      schema: DataFrameSchema | z.ZodTypeAny
     ): DataFrame;
     
-    filterValid<T extends SchemaDefinition>(
-      schema: DataFrameSchema<T>
+    filterValid(
+      schema: DataFrameSchema | z.ZodTypeAny
     ): DataFrame;
     
-    getInvalid<T extends SchemaDefinition>(
-      schema: DataFrameSchema<T>
+    getInvalid(
+      schema: DataFrameSchema | z.ZodTypeAny
     ): DataFrame;
   }
 }
 
-DataFrame.prototype.validate = function<T extends SchemaDefinition>(
-  schema: DataFrameSchema<T>,
+DataFrame.prototype.validate = function(
+  schema: DataFrameSchema | z.ZodTypeAny,
   options: ValidationOptions = {}
 ): ValidationResult {
   return SchemaValidator.validate(this, schema, options);
 };
 
-DataFrame.prototype.validateAndTransform = function<T extends SchemaDefinition>(
-  schema: DataFrameSchema<T>
+DataFrame.prototype.validateAndTransform = function(
+  schema: DataFrameSchema | z.ZodTypeAny
 ): DataFrame {
   return SchemaValidator.validateAndTransform(this, schema);
 };
 
-DataFrame.prototype.filterValid = function<T extends SchemaDefinition>(
-  schema: DataFrameSchema<T>
+DataFrame.prototype.filterValid = function(
+  schema: DataFrameSchema | z.ZodTypeAny
 ): DataFrame {
   return SchemaValidator.filterValid(this, schema);
 };
 
-DataFrame.prototype.getInvalid = function<T extends SchemaDefinition>(
-  schema: DataFrameSchema<T>
+DataFrame.prototype.getInvalid = function(
+  schema: DataFrameSchema | z.ZodTypeAny
 ): DataFrame {
   return SchemaValidator.getInvalid(this, schema);
 };

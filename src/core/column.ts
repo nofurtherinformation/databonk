@@ -43,12 +43,39 @@ export class Column<T = any> {
     if (index < 0 || index >= this.length) {
       throw new Error('Index out of bounds');
     }
-    
+
     if (this.nullBitmap.get(index)) {
       return null;
     }
-    
+
     return this.data[index] as T;
+  }
+
+  /**
+   * Get a value without bounds checking or null handling.
+   * Use only when caller ensures valid index and handles nulls separately.
+   * @internal
+   */
+  getRaw(index: number): T {
+    return this.data[index] as T;
+  }
+
+  /**
+   * Get direct reference to the underlying data array.
+   * Use for batch operations that need raw access.
+   * @internal
+   */
+  getDataRef(): TypedArrayInstance | any[] {
+    return this.data;
+  }
+
+  /**
+   * Get direct reference to the null bitmap.
+   * Use for batch null checking.
+   * @internal
+   */
+  getNullBitmapRef(): BitSet {
+    return this.nullBitmap;
   }
 
   isNull(index: number): boolean {
@@ -189,5 +216,66 @@ export class Column<T = any> {
 
   static from<T>(name: string, values: T[], dataType?: DataType): Column<T> {
     return new Column(name, values, dataType);
+  }
+
+  /**
+   * Create a Column directly from raw data without copying.
+   * Use for optimized construction when data is already in the correct format.
+   * @internal
+   */
+  static fromRaw<T>(
+    name: string,
+    data: TypedArrayInstance | any[],
+    nullBitmap: BitSet,
+    dataType: DataType
+  ): Column<T> {
+    // Create an instance without going through the normal constructor
+    const column = Object.create(Column.prototype) as Column<T>;
+    (column as any).name = name;
+    (column as any).dataType = dataType;
+    (column as any).data = data;
+    (column as any).nullBitmap = nullBitmap;
+    (column as any).length = data.length;
+    return column;
+  }
+
+  /**
+   * Select rows by indices with optimized batch copying.
+   * Much faster than calling get() for each index.
+   */
+  selectIndices(indices: number[]): Column<T> {
+    const newLength = indices.length;
+    const Constructor = TYPE_CONSTRUCTORS[this.dataType];
+
+    if (Constructor) {
+      // TypedArray fast path - batch copy
+      const newData = new Constructor(newLength);
+      const newNullBitmap = new BitSet(newLength);
+      const srcData = this.data as TypedArrayInstance;
+
+      for (let i = 0; i < newLength; i++) {
+        const srcIdx = indices[i];
+        newData[i] = srcData[srcIdx];
+        if (this.nullBitmap.get(srcIdx)) {
+          newNullBitmap.set(i, true);
+        }
+      }
+
+      return Column.fromRaw(this.name, newData, newNullBitmap, this.dataType);
+    }
+
+    // Regular array fallback
+    const newData: any[] = new Array(newLength);
+    const newNullBitmap = new BitSet(newLength);
+
+    for (let i = 0; i < newLength; i++) {
+      const srcIdx = indices[i];
+      newData[i] = this.data[srcIdx];
+      if (this.nullBitmap.get(srcIdx)) {
+        newNullBitmap.set(i, true);
+      }
+    }
+
+    return Column.fromRaw(this.name, newData, newNullBitmap, this.dataType);
   }
 }

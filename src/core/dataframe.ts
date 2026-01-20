@@ -1,7 +1,63 @@
-import { Column } from './column.js';
-import { DataType } from '../utils/types.js';
+import { Column } from './column';
+import { DataType } from '../utils/types';
 
 export type RowObject = Record<string, any>;
+
+/**
+ * RowProxy provides zero-allocation row access for iteration.
+ * Reuses a single object while iterating, avoiding object creation per row.
+ */
+export class RowProxy {
+  private columnCache: Map<string, Column> = new Map();
+  private index: number = 0;
+
+  constructor(df: DataFrame) {
+    for (const name of df.columnNames) {
+      this.columnCache.set(name, df.column(name));
+    }
+  }
+
+  /**
+   * Set the current row index.
+   * @returns this for chaining
+   */
+  setIndex(i: number): this {
+    this.index = i;
+    return this;
+  }
+
+  /**
+   * Get a value from the current row.
+   */
+  get(col: string): any {
+    const column = this.columnCache.get(col);
+    if (!column) {
+      throw new Error(`Column '${col}' not found`);
+    }
+    return column.get(this.index);
+  }
+
+  /**
+   * Get a value without null checking (faster for non-null columns).
+   */
+  getRaw(col: string): any {
+    return this.columnCache.get(col)!.getRaw(this.index);
+  }
+
+  /**
+   * Check if a column value is null at the current row.
+   */
+  isNull(col: string): boolean {
+    return this.columnCache.get(col)!.isNull(this.index);
+  }
+
+  /**
+   * Get the current row index.
+   */
+  getIndex(): number {
+    return this.index;
+  }
+}
 
 export class DataFrame {
   private columns: Map<string, Column> = new Map();
@@ -79,14 +135,24 @@ export class DataFrame {
 
   filter(predicate: (row: RowObject, index: number) => boolean): DataFrame {
     const indices: number[] = [];
-    
+
+    // Cache column references for the predicate
+    const columnRefs: Array<[string, Column]> = [];
+    this.columns.forEach((col, name) => columnRefs.push([name, col]));
+
+    // Reuse a single row object to reduce allocations
+    const row: RowObject = {};
+
     for (let i = 0; i < this.length; i++) {
-      const row = this.getRow(i);
+      // Populate row object using cached column references
+      for (const [name, col] of columnRefs) {
+        row[name] = col.get(i);
+      }
       if (predicate(row, i)) {
         indices.push(i);
       }
     }
-    
+
     return this.selectRows(indices);
   }
 
@@ -105,13 +171,38 @@ export class DataFrame {
 
   selectRows(indices: number[]): DataFrame {
     const selectedColumns: Record<string, Column> = {};
-    
+
     this.columns.forEach((column, name) => {
-      const values = indices.map(i => column.get(i));
-      selectedColumns[name] = new Column(name, values, column.dataType);
+      // Use optimized batch selection instead of individual get() calls
+      selectedColumns[name] = column.selectIndices(indices);
     });
-    
+
     return new DataFrame(selectedColumns);
+  }
+
+  /**
+   * Filter rows using a predicate function that receives a RowProxy.
+   * More efficient than filter() as it avoids creating a new object per row.
+   */
+  filterByIndex(predicate: (index: number, proxy: RowProxy) => boolean): DataFrame {
+    const proxy = new RowProxy(this);
+    const indices: number[] = [];
+
+    for (let i = 0; i < this.length; i++) {
+      if (predicate(i, proxy.setIndex(i))) {
+        indices.push(i);
+      }
+    }
+
+    return this.selectRows(indices);
+  }
+
+  /**
+   * Create a RowProxy for efficient iteration.
+   * Use this when you need to access multiple columns per row without allocation.
+   */
+  createRowProxy(): RowProxy {
+    return new RowProxy(this);
   }
 
   getRow(index: number): RowObject {
@@ -127,7 +218,7 @@ export class DataFrame {
     return row;
   }
 
-  *rows(): Iterator<RowObject> {
+  *rows(): IterableIterator<RowObject> {
     for (let i = 0; i < this.length; i++) {
       yield this.getRow(i);
     }

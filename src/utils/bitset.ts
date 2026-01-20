@@ -47,6 +47,72 @@ export class BitSet {
     return (((n + (n >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
   }
 
+  /**
+   * Get a batch of null flags as a bitmask.
+   * Useful for SIMD-style batch null checking.
+   * @param startIndex The starting index (must be aligned to 32 for optimal performance)
+   * @param count Number of bits to get (max 32)
+   * @returns A number where bit i is set if index (startIndex + i) is null
+   */
+  getNullMaskBatch(startIndex: number, count: number): number {
+    if (count <= 0 || count > 32) {
+      throw new Error('Count must be between 1 and 32');
+    }
+
+    const arrayIndex = Math.floor(startIndex / 32);
+    const bitOffset = startIndex % 32;
+
+    if (bitOffset === 0 && count === 32) {
+      // Aligned access - fast path
+      return this.data[arrayIndex] >>> 0;
+    }
+
+    // Extract bits across word boundaries if needed
+    let result = this.data[arrayIndex] >>> bitOffset;
+
+    if (bitOffset + count > 32 && arrayIndex + 1 < this.data.length) {
+      // Need bits from next word
+      const bitsFromFirst = 32 - bitOffset;
+      const bitsFromSecond = count - bitsFromFirst;
+      const nextWord = this.data[arrayIndex + 1];
+      result |= (nextWord & ((1 << bitsFromSecond) - 1)) << bitsFromFirst;
+    }
+
+    // Mask to requested count
+    return result & ((1 << count) - 1);
+  }
+
+  /**
+   * Check if any bit in a range is set.
+   * Faster than checking each bit individually.
+   */
+  anySet(startIndex: number, count: number): boolean {
+    const endIndex = Math.min(startIndex + count, this.length);
+
+    for (let i = startIndex; i < endIndex; ) {
+      const arrayIndex = Math.floor(i / 32);
+      const bitOffset = i % 32;
+      const bitsToCheck = Math.min(32 - bitOffset, endIndex - i);
+
+      const mask = ((1 << bitsToCheck) - 1) << bitOffset;
+      if ((this.data[arrayIndex] & mask) !== 0) {
+        return true;
+      }
+
+      i += bitsToCheck;
+    }
+
+    return false;
+  }
+
+  /**
+   * Get direct access to the underlying data array.
+   * @internal
+   */
+  getDataRef(): Uint32Array {
+    return this.data;
+  }
+
   *[Symbol.iterator](): Iterator<boolean> {
     for (let i = 0; i < this.length; i++) {
       yield this.get(i);

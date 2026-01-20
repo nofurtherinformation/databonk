@@ -86,6 +86,60 @@ class BitSet {
         n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
         return (((n + (n >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
     }
+    /**
+     * Get a batch of null flags as a bitmask.
+     * Useful for SIMD-style batch null checking.
+     * @param startIndex The starting index (must be aligned to 32 for optimal performance)
+     * @param count Number of bits to get (max 32)
+     * @returns A number where bit i is set if index (startIndex + i) is null
+     */
+    getNullMaskBatch(startIndex, count) {
+        if (count <= 0 || count > 32) {
+            throw new Error('Count must be between 1 and 32');
+        }
+        const arrayIndex = Math.floor(startIndex / 32);
+        const bitOffset = startIndex % 32;
+        if (bitOffset === 0 && count === 32) {
+            // Aligned access - fast path
+            return this.data[arrayIndex] >>> 0;
+        }
+        // Extract bits across word boundaries if needed
+        let result = this.data[arrayIndex] >>> bitOffset;
+        if (bitOffset + count > 32 && arrayIndex + 1 < this.data.length) {
+            // Need bits from next word
+            const bitsFromFirst = 32 - bitOffset;
+            const bitsFromSecond = count - bitsFromFirst;
+            const nextWord = this.data[arrayIndex + 1];
+            result |= (nextWord & ((1 << bitsFromSecond) - 1)) << bitsFromFirst;
+        }
+        // Mask to requested count
+        return result & ((1 << count) - 1);
+    }
+    /**
+     * Check if any bit in a range is set.
+     * Faster than checking each bit individually.
+     */
+    anySet(startIndex, count) {
+        const endIndex = Math.min(startIndex + count, this.length);
+        for (let i = startIndex; i < endIndex;) {
+            const arrayIndex = Math.floor(i / 32);
+            const bitOffset = i % 32;
+            const bitsToCheck = Math.min(32 - bitOffset, endIndex - i);
+            const mask = ((1 << bitsToCheck) - 1) << bitOffset;
+            if ((this.data[arrayIndex] & mask) !== 0) {
+                return true;
+            }
+            i += bitsToCheck;
+        }
+        return false;
+    }
+    /**
+     * Get direct access to the underlying data array.
+     * @internal
+     */
+    getDataRef() {
+        return this.data;
+    }
     *[Symbol.iterator]() {
         for (let i = 0; i < this.length; i++) {
             yield this.get(i);
@@ -127,6 +181,30 @@ class Column {
             return null;
         }
         return this.data[index];
+    }
+    /**
+     * Get a value without bounds checking or null handling.
+     * Use only when caller ensures valid index and handles nulls separately.
+     * @internal
+     */
+    getRaw(index) {
+        return this.data[index];
+    }
+    /**
+     * Get direct reference to the underlying data array.
+     * Use for batch operations that need raw access.
+     * @internal
+     */
+    getDataRef() {
+        return this.data;
+    }
+    /**
+     * Get direct reference to the null bitmap.
+     * Use for batch null checking.
+     * @internal
+     */
+    getNullBitmapRef() {
+        return this.nullBitmap;
     }
     isNull(index) {
         return this.nullBitmap.get(index);
@@ -238,8 +316,105 @@ class Column {
     static from(name, values, dataType) {
         return new Column(name, values, dataType);
     }
+    /**
+     * Create a Column directly from raw data without copying.
+     * Use for optimized construction when data is already in the correct format.
+     * @internal
+     */
+    static fromRaw(name, data, nullBitmap, dataType) {
+        // Create an instance without going through the normal constructor
+        const column = Object.create(Column.prototype);
+        column.name = name;
+        column.dataType = dataType;
+        column.data = data;
+        column.nullBitmap = nullBitmap;
+        column.length = data.length;
+        return column;
+    }
+    /**
+     * Select rows by indices with optimized batch copying.
+     * Much faster than calling get() for each index.
+     */
+    selectIndices(indices) {
+        const newLength = indices.length;
+        const Constructor = TYPE_CONSTRUCTORS[this.dataType];
+        if (Constructor) {
+            // TypedArray fast path - batch copy
+            const newData = new Constructor(newLength);
+            const newNullBitmap = new BitSet(newLength);
+            const srcData = this.data;
+            for (let i = 0; i < newLength; i++) {
+                const srcIdx = indices[i];
+                newData[i] = srcData[srcIdx];
+                if (this.nullBitmap.get(srcIdx)) {
+                    newNullBitmap.set(i, true);
+                }
+            }
+            return Column.fromRaw(this.name, newData, newNullBitmap, this.dataType);
+        }
+        // Regular array fallback
+        const newData = new Array(newLength);
+        const newNullBitmap = new BitSet(newLength);
+        for (let i = 0; i < newLength; i++) {
+            const srcIdx = indices[i];
+            newData[i] = this.data[srcIdx];
+            if (this.nullBitmap.get(srcIdx)) {
+                newNullBitmap.set(i, true);
+            }
+        }
+        return Column.fromRaw(this.name, newData, newNullBitmap, this.dataType);
+    }
 }
 
+/**
+ * RowProxy provides zero-allocation row access for iteration.
+ * Reuses a single object while iterating, avoiding object creation per row.
+ */
+class RowProxy {
+    constructor(df) {
+        this.columnCache = new Map();
+        this.index = 0;
+        for (const name of df.columnNames) {
+            this.columnCache.set(name, df.column(name));
+        }
+    }
+    /**
+     * Set the current row index.
+     * @returns this for chaining
+     */
+    setIndex(i) {
+        this.index = i;
+        return this;
+    }
+    /**
+     * Get a value from the current row.
+     */
+    get(col) {
+        const column = this.columnCache.get(col);
+        if (!column) {
+            throw new Error(`Column '${col}' not found`);
+        }
+        return column.get(this.index);
+    }
+    /**
+     * Get a value without null checking (faster for non-null columns).
+     */
+    getRaw(col) {
+        return this.columnCache.get(col).getRaw(this.index);
+    }
+    /**
+     * Check if a column value is null at the current row.
+     */
+    isNull(col) {
+        return this.columnCache.get(col).isNull(this.index);
+    }
+    /**
+     * Get the current row index.
+     */
+    getIndex() {
+        return this.index;
+    }
+}
 class DataFrame {
     constructor(data) {
         this.columns = new Map();
@@ -304,8 +479,16 @@ class DataFrame {
     }
     filter(predicate) {
         const indices = [];
+        // Cache column references for the predicate
+        const columnRefs = [];
+        this.columns.forEach((col, name) => columnRefs.push([name, col]));
+        // Reuse a single row object to reduce allocations
+        const row = {};
         for (let i = 0; i < this.length; i++) {
-            const row = this.getRow(i);
+            // Populate row object using cached column references
+            for (const [name, col] of columnRefs) {
+                row[name] = col.get(i);
+            }
             if (predicate(row, i)) {
                 indices.push(i);
             }
@@ -324,10 +507,31 @@ class DataFrame {
     selectRows(indices) {
         const selectedColumns = {};
         this.columns.forEach((column, name) => {
-            const values = indices.map(i => column.get(i));
-            selectedColumns[name] = new Column(name, values, column.dataType);
+            // Use optimized batch selection instead of individual get() calls
+            selectedColumns[name] = column.selectIndices(indices);
         });
         return new DataFrame(selectedColumns);
+    }
+    /**
+     * Filter rows using a predicate function that receives a RowProxy.
+     * More efficient than filter() as it avoids creating a new object per row.
+     */
+    filterByIndex(predicate) {
+        const proxy = new RowProxy(this);
+        const indices = [];
+        for (let i = 0; i < this.length; i++) {
+            if (predicate(i, proxy.setIndex(i))) {
+                indices.push(i);
+            }
+        }
+        return this.selectRows(indices);
+    }
+    /**
+     * Create a RowProxy for efficient iteration.
+     * Use this when you need to access multiple columns per row without allocation.
+     */
+    createRowProxy() {
+        return new RowProxy(this);
     }
     getRow(index) {
         if (index < 0 || index >= this.length) {
@@ -436,66 +640,310 @@ class DataFrame {
     }
 }
 
+/**
+ * StatAccumulator tracks multiple statistics in a single pass through the data.
+ * Uses Welford's online algorithm for numerically stable variance computation.
+ */
+class StatAccumulator {
+    constructor() {
+        this.count = 0;
+        this.sum = 0;
+        this.min = Infinity;
+        this.max = -Infinity;
+        this.mean_ = 0;
+        this.m2 = 0; // Sum of squares of differences from current mean
+    }
+    /**
+     * Add a single value to the accumulator.
+     * Updates all statistics in O(1) time.
+     */
+    add(value) {
+        this.count++;
+        this.sum += value;
+        if (value < this.min)
+            this.min = value;
+        if (value > this.max)
+            this.max = value;
+        // Welford's online algorithm for stable variance
+        const delta = value - this.mean_;
+        this.mean_ += delta / this.count;
+        const delta2 = value - this.mean_;
+        this.m2 += delta * delta2;
+    }
+    /**
+     * Get the mean of all added values.
+     */
+    getMean() {
+        return this.count > 0 ? this.mean_ : 0;
+    }
+    /**
+     * Get the sample variance (n-1 denominator).
+     */
+    getVariance() {
+        return this.count > 1 ? this.m2 / (this.count - 1) : 0;
+    }
+    /**
+     * Get the sample standard deviation.
+     */
+    getStd() {
+        return Math.sqrt(this.getVariance());
+    }
+    /**
+     * Get a specific aggregate value by function name.
+     */
+    getValue(fn) {
+        switch (fn) {
+            case 'sum':
+                return this.sum;
+            case 'mean':
+                return this.getMean();
+            case 'min':
+                return this.count > 0 ? this.min : NaN;
+            case 'max':
+                return this.count > 0 ? this.max : NaN;
+            case 'count':
+                return this.count;
+            case 'var':
+                return this.getVariance();
+            case 'std':
+                return this.getStd();
+            default:
+                throw new Error(`Unknown aggregate function: ${fn}`);
+        }
+    }
+    /**
+     * Merge another accumulator into this one.
+     * Useful for parallel aggregation.
+     */
+    merge(other) {
+        if (other.count === 0)
+            return;
+        if (this.count === 0) {
+            this.count = other.count;
+            this.sum = other.sum;
+            this.min = other.min;
+            this.max = other.max;
+            this.mean_ = other.mean_;
+            this.m2 = other.m2;
+            return;
+        }
+        const totalCount = this.count + other.count;
+        const delta = other.mean_ - this.mean_;
+        // Combined mean
+        this.mean_ = (this.count * this.mean_ + other.count * other.mean_) / totalCount;
+        // Combined M2 using parallel algorithm
+        this.m2 = this.m2 + other.m2 + delta * delta * this.count * other.count / totalCount;
+        this.sum += other.sum;
+        this.count = totalCount;
+        if (other.min < this.min)
+            this.min = other.min;
+        if (other.max > this.max)
+            this.max = other.max;
+    }
+    /**
+     * Reset the accumulator for reuse.
+     */
+    reset() {
+        this.count = 0;
+        this.sum = 0;
+        this.min = Infinity;
+        this.max = -Infinity;
+        this.mean_ = 0;
+        this.m2 = 0;
+    }
+}
+/**
+ * GroupedAccumulators manages StatAccumulators for multiple groups and columns.
+ * Enables single-pass aggregation across all groups and aggregate functions.
+ */
+class GroupedAccumulators {
+    constructor(columns) {
+        // Map of groupKey -> columnName -> StatAccumulator
+        this.accumulators = new Map();
+        this.columns = columns;
+    }
+    /**
+     * Get or create the accumulator for a group and column.
+     */
+    getAccumulator(groupKey, columnName) {
+        let groupAccs = this.accumulators.get(groupKey);
+        if (!groupAccs) {
+            groupAccs = new Map();
+            this.accumulators.set(groupKey, groupAccs);
+        }
+        let acc = groupAccs.get(columnName);
+        if (!acc) {
+            acc = new StatAccumulator();
+            groupAccs.set(columnName, acc);
+        }
+        return acc;
+    }
+    /**
+     * Add a value for a specific group and column.
+     */
+    add(groupKey, columnName, value) {
+        if (value !== null && !isNaN(value)) {
+            this.getAccumulator(groupKey, columnName).add(value);
+        }
+    }
+    /**
+     * Get all group keys.
+     */
+    getGroups() {
+        return Array.from(this.accumulators.keys());
+    }
+    /**
+     * Get the aggregate value for a group and column.
+     */
+    getValue(groupKey, columnName, fn) {
+        const acc = this.accumulators.get(groupKey)?.get(columnName);
+        if (!acc) {
+            return fn === 'count' ? 0 : NaN;
+        }
+        return acc.getValue(fn);
+    }
+    /**
+     * Get the count for a group (same across all columns).
+     */
+    getGroupCount(groupKey) {
+        const groupAccs = this.accumulators.get(groupKey);
+        if (!groupAccs)
+            return 0;
+        // Return count from the first column accumulator
+        for (const acc of groupAccs.values()) {
+            return acc.count;
+        }
+        return 0;
+    }
+}
+/**
+ * Creates an aggregation plan from a spec object.
+ */
+function createAggregationPlan(spec) {
+    const columns = [];
+    const functions = new Map();
+    for (const [colName, fns] of Object.entries(spec)) {
+        const fnArray = Array.isArray(fns) ? fns : [fns];
+        columns.push(colName);
+        functions.set(colName, fnArray);
+    }
+    return { columns, functions };
+}
+
 class GroupBy {
     constructor(df, columns) {
-        this.groups = new Map();
+        this.groupOrder = []; // Track insertion order for consistent output
         this.df = df;
         this.groupColumns = columns;
+        // Cache column references once
+        this.cachedGroupCols = columns.map(c => df.column(c));
+        this.groups = new Map();
         this.computeGroups();
     }
     computeGroups() {
         for (let i = 0; i < this.df.length; i++) {
             const key = this.createGroupKey(i);
-            if (!this.groups.has(key)) {
-                this.groups.set(key, []);
+            const existingIndices = this.groups.get(key);
+            if (existingIndices) {
+                existingIndices.push(i);
             }
-            this.groups.get(key).push(i);
+            else {
+                this.groups.set(key, [i]);
+                this.groupOrder.push({
+                    key,
+                    firstRowIndex: i
+                });
+            }
         }
     }
+    /**
+     * Create a simple string key for a row using '||' separator.
+     */
     createGroupKey(rowIndex) {
-        const keyParts = this.groupColumns.map(colName => {
-            const column = this.df.column(colName);
-            const value = column.get(rowIndex);
-            return value === null ? '__NULL__' : String(value);
-        });
-        return keyParts.join('||');
+        let key = '';
+        for (let i = 0; i < this.cachedGroupCols.length; i++) {
+            if (i > 0)
+                key += '||';
+            const val = this.cachedGroupCols[i].get(rowIndex);
+            key += val === null ? '\0' : String(val);
+        }
+        return key;
     }
-    parseGroupKey(key) {
-        return key.split('||').map(part => part === '__NULL__' ? null : part);
-    }
+    /**
+     * Perform aggregation using single-pass algorithm for efficiency.
+     */
     agg(spec) {
         const resultColumns = {};
-        this.groupColumns.forEach(colName => {
+        // Build list of columns to aggregate and their functions
+        const aggPlan = createAggregationPlan(spec);
+        // Separate count-only columns from columns that need actual data
+        const countOnlyColumns = new Set();
+        const dataColumns = [];
+        for (const [colName, fns] of aggPlan.functions) {
+            const fnArray = Array.isArray(fns) ? fns : [fns];
+            const hasOnlyCount = fnArray.every(fn => fn === 'count');
+            if (hasOnlyCount && !this.df.hasColumn(colName)) {
+                // This is a count-only column (like { count: 'count' })
+                countOnlyColumns.add(colName);
+            }
+            else {
+                dataColumns.push(colName);
+            }
+        }
+        // Cache column references for aggregation columns (excluding count-only)
+        const aggColumnRefs = new Map();
+        for (const colName of dataColumns) {
+            aggColumnRefs.set(colName, this.df.column(colName));
+        }
+        // Single-pass aggregation: create accumulators for each group
+        const groupedAccs = new GroupedAccumulators(dataColumns);
+        // Iterate through data once, accumulating all stats
+        for (let i = 0; i < this.df.length; i++) {
+            // Compute group key
+            const key = this.createGroupKey(i);
+            // Add values to accumulators for each aggregation column
+            for (const colName of dataColumns) {
+                const value = aggColumnRefs.get(colName).get(i);
+                if (value !== null && typeof value === 'number' && !isNaN(value)) {
+                    groupedAccs.getAccumulator(key, colName).add(value);
+                }
+                else if (value !== null) {
+                    // For count, we still need to track non-null values
+                    // Use a dummy add for tracking count
+                    groupedAccs.getAccumulator(key, colName);
+                }
+            }
+        }
+        // Build result columns for group keys (preserve original order)
+        this.groupColumns.forEach((colName, colIdx) => {
             const groupValues = [];
-            for (const key of this.groups.keys()) {
-                const keyValues = this.parseGroupKey(key);
-                const colIndex = this.groupColumns.indexOf(colName);
-                groupValues.push(keyValues[colIndex]);
+            const column = this.cachedGroupCols[colIdx];
+            for (const entry of this.groupOrder) {
+                const indices = this.groups.get(entry.key);
+                if (indices && indices.length > 0) {
+                    groupValues.push(column.get(indices[0]));
+                }
             }
             resultColumns[colName] = new Column(colName, groupValues);
         });
-        Object.entries(spec).forEach(([colName, functions]) => {
-            const funcArray = Array.isArray(functions) ? functions : [functions];
-            funcArray.forEach(fn => {
+        // Build result columns for aggregated values
+        for (const [colName, fns] of aggPlan.functions) {
+            for (const fn of fns) {
                 const aggValues = [];
-                for (const indices of this.groups.values()) {
-                    let value;
-                    if (fn === 'count') {
-                        // Count doesn't need actual column values, just the number of rows
-                        value = indices.length;
+                for (const entry of this.groupOrder) {
+                    if (fn === 'count' || countOnlyColumns.has(colName)) {
+                        // For count, return number of rows in group
+                        const indices = this.groups.get(entry.key);
+                        aggValues.push(indices ? indices.length : 0);
                     }
                     else {
-                        // For other aggregations, we need the actual column values
-                        const groupValues = indices.map(i => this.df.column(colName).get(i));
-                        const groupColumn = new Column(`temp_${colName}`, groupValues);
-                        value = this.computeAggregateValue(groupColumn, fn);
+                        aggValues.push(groupedAccs.getValue(entry.key, colName, fn));
                     }
-                    aggValues.push(value);
                 }
-                const resultColName = funcArray.length === 1 ? colName : `${colName}_${fn}`;
+                const resultColName = fns.length === 1 ? colName : `${colName}_${fn}`;
                 resultColumns[resultColName] = new Column(resultColName, aggValues, 'float64');
-            });
-        });
+            }
+        }
         return new DataFrame(resultColumns);
     }
     computeAggregateValue(column, fn) {
@@ -538,7 +986,27 @@ class GroupBy {
         return Math.sqrt(this.computeVar(column));
     }
     count() {
-        return this.agg({ count: 'count' });
+        const resultColumns = {};
+        // Build group key columns
+        this.groupColumns.forEach((colName, colIdx) => {
+            const column = this.cachedGroupCols[colIdx];
+            const values = [];
+            for (const entry of this.groupOrder) {
+                const indices = this.groups.get(entry.key);
+                if (indices && indices.length > 0) {
+                    values.push(column.get(indices[0]));
+                }
+            }
+            resultColumns[colName] = new Column(colName, values);
+        });
+        // Add count column
+        const counts = [];
+        for (const entry of this.groupOrder) {
+            const indices = this.groups.get(entry.key);
+            counts.push(indices ? indices.length : 0);
+        }
+        resultColumns['count'] = new Column('count', counts, 'int32');
+        return new DataFrame(resultColumns);
     }
     sum(columns) {
         const spec = {};
@@ -570,19 +1038,17 @@ class GroupBy {
     }
     first() {
         const resultColumns = {};
+        // Cache all column references
+        const colRefs = new Map();
+        for (const colName of this.df.columnNames) {
+            colRefs.set(colName, this.df.column(colName));
+        }
         this.df.columnNames.forEach(colName => {
             const values = [];
-            if (this.groupColumns.includes(colName)) {
-                for (const key of this.groups.keys()) {
-                    const keyValues = this.parseGroupKey(key);
-                    const colIndex = this.groupColumns.indexOf(colName);
-                    values.push(keyValues[colIndex]);
-                }
-            }
-            else {
-                for (const indices of this.groups.values()) {
-                    const firstIndex = indices[0];
-                    values.push(this.df.column(colName).get(firstIndex));
+            for (const entry of this.groupOrder) {
+                const indices = this.groups.get(entry.key);
+                if (indices && indices.length > 0) {
+                    values.push(colRefs.get(colName).get(indices[0]));
                 }
             }
             resultColumns[colName] = new Column(colName, values);
@@ -591,19 +1057,17 @@ class GroupBy {
     }
     last() {
         const resultColumns = {};
+        // Cache all column references
+        const colRefs = new Map();
+        for (const colName of this.df.columnNames) {
+            colRefs.set(colName, this.df.column(colName));
+        }
         this.df.columnNames.forEach(colName => {
             const values = [];
-            if (this.groupColumns.includes(colName)) {
-                for (const key of this.groups.keys()) {
-                    const keyValues = this.parseGroupKey(key);
-                    const colIndex = this.groupColumns.indexOf(colName);
-                    values.push(keyValues[colIndex]);
-                }
-            }
-            else {
-                for (const indices of this.groups.values()) {
-                    const lastIndex = indices[indices.length - 1];
-                    values.push(this.df.column(colName).get(lastIndex));
+            for (const entry of this.groupOrder) {
+                const indices = this.groups.get(entry.key);
+                if (indices && indices.length > 0) {
+                    values.push(colRefs.get(colName).get(indices[indices.length - 1]));
                 }
             }
             resultColumns[colName] = new Column(colName, values);
@@ -611,15 +1075,22 @@ class GroupBy {
         return new DataFrame(resultColumns);
     }
     size() {
-        const groupKeys = Array.from(this.groups.keys());
-        const groupSizes = Array.from(this.groups.values()).map(indices => indices.length);
         const resultColumns = {};
-        this.groupColumns.forEach(colName => {
-            const values = groupKeys.map(key => {
-                const keyValues = this.parseGroupKey(key);
-                const colIndex = this.groupColumns.indexOf(colName);
-                return keyValues[colIndex];
-            });
+        const groupSizes = [];
+        // Build group key columns and sizes
+        this.groupColumns.forEach((colName, colIdx) => {
+            const column = this.cachedGroupCols[colIdx];
+            const values = [];
+            for (const entry of this.groupOrder) {
+                const indices = this.groups.get(entry.key);
+                if (indices && indices.length > 0) {
+                    values.push(column.get(indices[0]));
+                    // Only add to groupSizes on first column iteration
+                    if (colIdx === 0) {
+                        groupSizes.push(indices.length);
+                    }
+                }
+            }
             resultColumns[colName] = new Column(colName, values);
         });
         resultColumns['size'] = new Column('size', groupSizes, 'int32');
@@ -629,6 +1100,75 @@ class GroupBy {
 DataFrame.prototype.groupBy = function (columns) {
     return new GroupBy(this, columns);
 };
+
+/**
+ * IndexCache provides caching for hash indices used in join and groupBy operations.
+ * Uses WeakMap to allow garbage collection of DataFrames.
+ */
+class IndexCache {
+    constructor(maxAge = 60000) {
+        this.cache = new WeakMap();
+        this.maxAge = maxAge;
+    }
+    /**
+     * Generate a cache key from column names.
+     */
+    getCacheKey(columns) {
+        return columns.slice().sort().join('\x00');
+    }
+    /**
+     * Get a cached index for the given DataFrame and columns.
+     * Returns null if not cached or expired.
+     */
+    getIndex(df, columns) {
+        const dfCache = this.cache.get(df);
+        if (!dfCache)
+            return null;
+        const key = this.getCacheKey(columns);
+        const cached = dfCache.get(key);
+        if (!cached)
+            return null;
+        // Check if expired
+        if (Date.now() - cached.createdAt > this.maxAge) {
+            dfCache.delete(key);
+            return null;
+        }
+        return cached.index;
+    }
+    /**
+     * Store an index in the cache.
+     */
+    setIndex(df, columns, index) {
+        let dfCache = this.cache.get(df);
+        if (!dfCache) {
+            dfCache = new Map();
+            this.cache.set(df, dfCache);
+        }
+        const key = this.getCacheKey(columns);
+        dfCache.set(key, {
+            columns: columns.slice(),
+            index,
+            createdAt: Date.now()
+        });
+    }
+    /**
+     * Invalidate all cached indices for a DataFrame.
+     */
+    invalidate(df) {
+        this.cache.delete(df);
+    }
+    /**
+     * Clear all cached indices.
+     */
+    clear() {
+        // WeakMap doesn't have a clear method, so we create a new one
+        this.cache = new WeakMap();
+    }
+}
+/**
+ * Global index cache instance for shared use across operations.
+ */
+const globalIndexCache = new IndexCache();
 
 class Joiner {
     static join(left, right, on, how = 'inner', suffixes = ['_x', '_y']) {
@@ -659,33 +1199,67 @@ class Joiner {
             }
         });
     }
-    static buildHashIndex(df, keys) {
-        const index = new Map();
-        for (let i = 0; i < df.length; i++) {
-            const keyValue = this.createJoinKey(df, i, keys);
-            if (!index.has(keyValue)) {
-                index.set(keyValue, []);
+    static buildHashIndex(df, keys, useCache = true) {
+        // Check cache first
+        if (useCache) {
+            const cached = globalIndexCache.getIndex(df, keys);
+            if (cached) {
+                return cached;
             }
-            index.get(keyValue).push(i);
+        }
+        const index = new Map();
+        // Cache column references once before the loop
+        const columns = keys.map(k => df.column(k));
+        for (let i = 0; i < df.length; i++) {
+            const key = this.createJoinKey(columns, i);
+            const indices = index.get(key);
+            if (indices) {
+                indices.push(i);
+            }
+            else {
+                index.set(key, [i]);
+            }
+        }
+        // Store in cache
+        if (useCache) {
+            globalIndexCache.setIndex(df, keys, index);
         }
         return index;
     }
-    static createJoinKey(df, rowIndex, keys) {
-        const keyParts = keys.map(key => {
-            const column = df.column(key);
-            const value = column.get(rowIndex);
-            return value === null ? '__NULL__' : String(value);
-        });
-        return keyParts.join('||');
+    /**
+     * Create a simple string key for a row using '||' separator.
+     */
+    static createJoinKey(columns, rowIndex) {
+        let key = '';
+        for (let i = 0; i < columns.length; i++) {
+            if (i > 0)
+                key += '||';
+            const val = columns[i].get(rowIndex);
+            key += val === null ? '\0' : String(val);
+        }
+        return key;
     }
     static innerJoin(left, right, leftIndex, rightIndex, joinKeys, suffixes) {
         const matches = [];
-        for (const [key, leftIndices] of leftIndex) {
+        // Cache column references for key lookups
+        const leftColumns = joinKeys.map(k => left.column(k));
+        // Track which left rows have been processed to avoid duplicates
+        const processedLeft = new Set();
+        // Iterate through left rows in original order
+        for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+            if (processedLeft.has(leftIdx))
+                continue;
+            const key = this.createJoinKey(leftColumns, leftIdx);
             const rightIndices = rightIndex.get(key);
             if (rightIndices) {
-                for (const leftIdx of leftIndices) {
-                    for (const rightIdx of rightIndices) {
-                        matches.push([leftIdx, rightIdx]);
+                // Get all left rows with the same key
+                const leftIndices = leftIndex.get(key);
+                if (leftIndices) {
+                    for (const lIdx of leftIndices) {
+                        processedLeft.add(lIdx);
+                        for (const rightIdx of rightIndices) {
+                            matches.push([lIdx, rightIdx]);
+                        }
                     }
                 }
             }
@@ -694,18 +1268,26 @@ class Joiner {
     }
     static leftJoin(left, right, leftIndex, rightIndex, joinKeys, suffixes) {
         const matches = [];
-        for (const [key, leftIndices] of leftIndex) {
+        const leftColumns = joinKeys.map(k => left.column(k));
+        const processedLeft = new Set();
+        // Iterate through left rows in original order
+        for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+            if (processedLeft.has(leftIdx))
+                continue;
+            const key = this.createJoinKey(leftColumns, leftIdx);
             const rightIndices = rightIndex.get(key);
-            if (rightIndices) {
-                for (const leftIdx of leftIndices) {
-                    for (const rightIdx of rightIndices) {
-                        matches.push([leftIdx, rightIdx]);
+            const leftIndices = leftIndex.get(key);
+            if (leftIndices) {
+                for (const lIdx of leftIndices) {
+                    processedLeft.add(lIdx);
+                    if (rightIndices) {
+                        for (const rightIdx of rightIndices) {
+                            matches.push([lIdx, rightIdx]);
+                        }
                     }
-                }
-            }
-            else {
-                for (const leftIdx of leftIndices) {
-                    matches.push([leftIdx, null]);
+                    else {
+                        matches.push([lIdx, null]);
+                    }
                 }
             }
         }
@@ -713,18 +1295,26 @@ class Joiner {
     }
     static rightJoin(left, right, leftIndex, rightIndex, joinKeys, suffixes) {
         const matches = [];
-        for (const [key, rightIndices] of rightIndex) {
+        const rightColumns = joinKeys.map(k => right.column(k));
+        const processedRight = new Set();
+        // Iterate through right rows in original order
+        for (let rightIdx = 0; rightIdx < right.length; rightIdx++) {
+            if (processedRight.has(rightIdx))
+                continue;
+            const key = this.createJoinKey(rightColumns, rightIdx);
             const leftIndices = leftIndex.get(key);
-            if (leftIndices) {
-                for (const rightIdx of rightIndices) {
-                    for (const leftIdx of leftIndices) {
-                        matches.push([leftIdx, rightIdx]);
+            const rightIndices = rightIndex.get(key);
+            if (rightIndices) {
+                for (const rIdx of rightIndices) {
+                    processedRight.add(rIdx);
+                    if (leftIndices) {
+                        for (const leftIdx of leftIndices) {
+                            matches.push([leftIdx, rIdx]);
+                        }
                     }
-                }
-            }
-            else {
-                for (const rightIdx of rightIndices) {
-                    matches.push([null, rightIdx]);
+                    else {
+                        matches.push([null, rIdx]);
+                    }
                 }
             }
         }
@@ -733,27 +1323,37 @@ class Joiner {
     static outerJoin(left, right, leftIndex, rightIndex, joinKeys, suffixes) {
         const matches = [];
         const processedRightKeys = new Set();
-        for (const [key, leftIndices] of leftIndex) {
+        const processedLeft = new Set();
+        const leftColumns = joinKeys.map(k => left.column(k));
+        const rightColumns = joinKeys.map(k => right.column(k));
+        // Process left side first (in original order)
+        for (let leftIdx = 0; leftIdx < left.length; leftIdx++) {
+            if (processedLeft.has(leftIdx))
+                continue;
+            const key = this.createJoinKey(leftColumns, leftIdx);
             const rightIndices = rightIndex.get(key);
-            if (rightIndices) {
-                processedRightKeys.add(key);
-                for (const leftIdx of leftIndices) {
-                    for (const rightIdx of rightIndices) {
-                        matches.push([leftIdx, rightIdx]);
+            const leftIndices = leftIndex.get(key);
+            if (leftIndices) {
+                for (const lIdx of leftIndices) {
+                    processedLeft.add(lIdx);
+                    if (rightIndices) {
+                        processedRightKeys.add(key);
+                        for (const rightIdx of rightIndices) {
+                            matches.push([lIdx, rightIdx]);
+                        }
+                    }
+                    else {
+                        matches.push([lIdx, null]);
                     }
                 }
             }
-            else {
-                for (const leftIdx of leftIndices) {
-                    matches.push([leftIdx, null]);
-                }
-            }
         }
-        for (const [key, rightIndices] of rightIndex) {
+        // Add unmatched right rows (in original order)
+        for (let rightIdx = 0; rightIdx < right.length; rightIdx++) {
+            const key = this.createJoinKey(rightColumns, rightIdx);
             if (!processedRightKeys.has(key)) {
-                for (const rightIdx of rightIndices) {
-                    matches.push([null, rightIdx]);
-                }
+                matches.push([null, rightIdx]);
+                processedRightKeys.add(key); // Mark this key as processed
             }
         }
         return this.buildJoinedDataFrame(left, right, matches, joinKeys, suffixes);
@@ -1203,7 +1803,7 @@ DataFrame.prototype.sum = function (columns) {
     });
     const spec = {};
     cols.forEach(col => {
-        spec[`${col}_sum`] = col;
+        spec[col] = ['sum'];
     });
     return Aggregator.agg(this, spec);
 };
@@ -1214,7 +1814,7 @@ DataFrame.prototype.mean = function (columns) {
     });
     const spec = {};
     cols.forEach(col => {
-        spec[`${col}_mean`] = col;
+        spec[col] = ['mean'];
     });
     return Aggregator.agg(this, spec);
 };
@@ -1222,7 +1822,7 @@ DataFrame.prototype.count = function (columns) {
     const cols = columns || this.columnNames;
     const spec = {};
     cols.forEach(col => {
-        spec[`${col}_count`] = col;
+        spec[col] = ['count'];
     });
     return Aggregator.agg(this, spec);
 };
@@ -1233,7 +1833,7 @@ DataFrame.prototype.min = function (columns) {
     });
     const spec = {};
     cols.forEach(col => {
-        spec[`${col}_min`] = col;
+        spec[col] = ['min'];
     });
     return Aggregator.agg(this, spec);
 };
@@ -1244,7 +1844,7 @@ DataFrame.prototype.max = function (columns) {
     });
     const spec = {};
     cols.forEach(col => {
-        spec[`${col}_max`] = col;
+        spec[col] = ['max'];
     });
     return Aggregator.agg(this, spec);
 };
@@ -1252,7 +1852,11 @@ DataFrame.prototype.max = function (columns) {
 class CsvReader {
     static fromString(csvString, options = {}) {
         const { delimiter = ',', header = true, skipRows = 0, inferTypes = true } = options;
-        const lines = csvString.trim().split('\n').slice(skipRows);
+        const trimmed = csvString.trim();
+        if (trimmed === '') {
+            return new DataFrame({});
+        }
+        const lines = trimmed.split('\n').slice(skipRows);
         if (lines.length === 0) {
             return new DataFrame({});
         }
@@ -5154,13 +5758,41 @@ class SchemaValidator {
         for (let i = 0; i < df.length; i++) {
             const row = df.getRow(i);
             try {
-                if (coerce) {
-                    schema.parse(row);
+                let rowToValidate = row;
+                // Try parsing with original row first (preserves null for nullable fields)
+                try {
+                    if (coerce) {
+                        schema.parse(row);
+                    }
+                    else {
+                        schema.parse(row);
+                    }
+                    validRows++;
+                    continue;
                 }
-                else {
-                    schema.strict().parse(row);
+                catch (firstError) {
+                    // If parsing fails with null-related error, try normalizing null to undefined
+                    // This handles optional fields that don't accept null
+                    if (firstError instanceof ZodError) {
+                        const hasNullError = firstError.issues.some(issue => issue.message.includes('null') &&
+                            (issue.code === 'invalid_type' || issue.message.includes('Expected')));
+                        if (hasNullError) {
+                            // Normalize null to undefined for optional fields (recursively for nested objects)
+                            rowToValidate = normalizeNullToUndefined(row);
+                            // Retry with normalized row
+                            if (coerce) {
+                                schema.parse(rowToValidate);
+                            }
+                            else {
+                                schema.parse(rowToValidate);
+                            }
+                            validRows++;
+                            continue;
+                        }
+                    }
+                    // Re-throw if normalization didn't help
+                    throw firstError;
                 }
-                validRows++;
             }
             catch (error) {
                 if (error instanceof ZodError) {
@@ -5188,8 +5820,23 @@ class SchemaValidator {
         const transformedRows = [];
         for (let i = 0; i < df.length; i++) {
             const row = df.getRow(i);
+            let rowToValidate = row;
             try {
-                const validatedRow = schema.parse(row);
+                // Try with original row first
+                schema.parse(row);
+            }
+            catch (firstError) {
+                // If parsing fails with null-related error, try normalizing
+                if (firstError instanceof ZodError) {
+                    const hasNullError = firstError.issues.some(issue => issue.message.includes('null') &&
+                        (issue.code === 'invalid_type' || issue.message.includes('Expected')));
+                    if (hasNullError) {
+                        rowToValidate = normalizeNullToUndefined(row);
+                    }
+                }
+            }
+            try {
+                const validatedRow = schema.parse(rowToValidate);
                 transformedRows.push(validatedRow);
             }
             catch (error) {
@@ -5202,9 +5849,24 @@ class SchemaValidator {
         const validRows = [];
         for (let i = 0; i < df.length; i++) {
             const row = df.getRow(i);
+            let rowToValidate = row;
             try {
+                // Try with original row first
                 schema.parse(row);
-                validRows.push(row);
+            }
+            catch (firstError) {
+                // If parsing fails with null-related error, try normalizing
+                if (firstError instanceof ZodError) {
+                    const hasNullError = firstError.issues.some(issue => issue.message.includes('null') &&
+                        (issue.code === 'invalid_type' || issue.message.includes('Expected')));
+                    if (hasNullError) {
+                        rowToValidate = normalizeNullToUndefined(row);
+                    }
+                }
+            }
+            try {
+                schema.parse(rowToValidate);
+                validRows.push(row); // Keep original row with null values
             }
             catch (error) {
                 // Skip invalid rows
@@ -5216,8 +5878,23 @@ class SchemaValidator {
         const invalidIndices = [];
         for (let i = 0; i < df.length; i++) {
             const row = df.getRow(i);
+            let rowToValidate = row;
             try {
+                // Try with original row first
                 schema.parse(row);
+            }
+            catch (firstError) {
+                // If parsing fails with null-related error, try normalizing
+                if (firstError instanceof ZodError) {
+                    const hasNullError = firstError.issues.some(issue => issue.message.includes('null') &&
+                        (issue.code === 'invalid_type' || issue.message.includes('Expected')));
+                    if (hasNullError) {
+                        rowToValidate = normalizeNullToUndefined(row);
+                    }
+                }
+            }
+            try {
+                schema.parse(rowToValidate);
             }
             catch (error) {
                 invalidIndices.push(i);
@@ -5225,6 +5902,19 @@ class SchemaValidator {
         }
         return df.selectRows(invalidIndices);
     }
+}
+// Recursively normalize null to undefined for optional fields
+function normalizeNullToUndefined(value) {
+    if (value === null) {
+        return undefined;
+    }
+    if (Array.isArray(value)) {
+        return value.map(normalizeNullToUndefined);
+    }
+    if (value && typeof value === 'object' && !(value instanceof Date)) {
+        return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, normalizeNullToUndefined(val)]));
+    }
+    return value;
 }
 // Common schema builders
 class SchemaBuilders {

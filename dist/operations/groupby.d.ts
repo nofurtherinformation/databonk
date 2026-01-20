@@ -4,10 +4,17 @@ export declare class GroupBy {
     private df;
     private groupColumns;
     private groups;
+    private groupOrder;
+    private cachedGroupCols;
     constructor(df: DataFrame, columns: string[]);
     private computeGroups;
+    /**
+     * Create a simple string key for a row using '||' separator.
+     */
     private createGroupKey;
-    private parseGroupKey;
+    /**
+     * Perform aggregation using single-pass algorithm for efficiency.
+     */
     agg(spec: Record<string, AggregateFunction | AggregateFunction[]>): DataFrame;
     private computeAggregateValue;
     private computeVar;
