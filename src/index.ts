@@ -1,7 +1,18 @@
-export { DataFrame } from './core/dataframe.js';
+export { DataFrame, DataFrameOptions } from './core/dataframe.js';
 export { Column } from './core/column.js';
+export { IndexManager } from './core/index-manager.js';
+export {
+  IndexType,
+  IndexOptions,
+  IndexEntry,
+  IndexData,
+  HashIndexData,
+  SortedIndexData,
+  UniqueIndexData,
+  IndexLookupResult,
+} from './core/index.js';
 export { GroupBy } from './operations/groupby.js';
-export { Joiner, JoinType } from './operations/join.js';
+export { Joiner, JoinType, JoinAlgorithm, JoinOptions } from './operations/join.js';
 export { Reshaper } from './operations/reshape.js';
 export { ColumnDeriver, ColumnExpression } from './operations/derive.js';
 export { Aggregator, AggregateFunction, AggregateSpec } from './operations/aggregation.js';
@@ -20,6 +31,7 @@ export { DataType } from './utils/types.js';
 export { BitSet } from './utils/bitset.js';
 export { PerformanceTimer, DataGenerator, MemoryProfiler } from './utils/performance.js';
 
+import './core/index-manager.js';
 import './operations/aggregation.js';
 import './operations/groupby.js';
 import './operations/join.js';

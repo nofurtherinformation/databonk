@@ -1,7 +1,32 @@
 import { Column } from './column';
 import { DataType } from '../utils/types';
+import { IndexManager } from './index-manager.js';
+import { IndexOptions, IndexEntry, IndexType } from './index.js';
 
 export type RowObject = Record<string, any>;
+
+/**
+ * Options for DataFrame factory methods.
+ */
+export interface DataFrameOptions {
+  /**
+   * Indices to create on the DataFrame at construction time.
+   *
+   * @example
+   * const df = DataFrame.fromRows(data, {
+   *   indices: [
+   *     { columns: 'id', type: 'unique' },
+   *     { columns: 'department' },
+   *     { columns: ['year', 'region'], type: 'sorted' }
+   *   ]
+   * });
+   */
+  indices?: Array<{
+    columns: string | string[];
+    type?: IndexType;
+    name?: string;
+  }>;
+}
 
 /**
  * RowProxy provides zero-allocation row access for iteration.
@@ -62,6 +87,7 @@ export class RowProxy {
 export class DataFrame {
   private columns: Map<string, Column> = new Map();
   public readonly length: number;
+  private _indexManager: IndexManager | null = null;
 
   constructor(data: Record<string, Column> | Column[]) {
     if (Array.isArray(data)) {
@@ -300,37 +326,131 @@ export class DataFrame {
     return result;
   }
 
-  static from(data: RowObject[] | Record<string, any[]>): DataFrame {
+  // ==================== Index Methods ====================
+
+  /**
+   * Get the IndexManager for this DataFrame.
+   * Creates one lazily if it doesn't exist.
+   */
+  get indexManager(): IndexManager {
+    if (!this._indexManager) {
+      this._indexManager = new IndexManager();
+    }
+    return this._indexManager;
+  }
+
+  /**
+   * Create an index on one or more columns.
+   *
+   * @param columns - Column name(s) to index
+   * @param options - Index options (type: 'hash' | 'sorted' | 'unique', name: string)
+   * @returns This DataFrame for chaining
+   *
+   * @example
+   * // Create a hash index (default)
+   * df.createIndex('userId');
+   *
+   * // Create a sorted index for range queries / merge-join
+   * df.createIndex(['year', 'region'], { type: 'sorted' });
+   *
+   * // Create a unique index (enforces uniqueness)
+   * df.createIndex('id', { type: 'unique' });
+   */
+  createIndex(columns: string | string[], options?: IndexOptions): this {
+    this.indexManager.createIndex(this, columns, options);
+    return this;
+  }
+
+  /**
+   * Drop an index by name.
+   *
+   * @param name - The index name
+   * @returns true if dropped, false if not found
+   */
+  dropIndex(name: string): boolean {
+    if (!this._indexManager) return false;
+    return this._indexManager.dropIndex(name);
+  }
+
+  /**
+   * Check if an index exists for the given column(s).
+   *
+   * @param columns - Column name(s) to check
+   * @returns true if an index exists
+   */
+  hasIndex(columns: string | string[]): boolean {
+    if (!this._indexManager) return false;
+    return this._indexManager.hasIndex(columns);
+  }
+
+  /**
+   * List all index names on this DataFrame.
+   */
+  listIndices(): string[] {
+    if (!this._indexManager) return [];
+    return this._indexManager.listIndices();
+  }
+
+  /**
+   * Get an index by name or columns.
+   *
+   * @param nameOrColumns - Index name or column names
+   * @returns The index entry or null
+   */
+  getIndex(nameOrColumns: string | string[]): IndexEntry | null {
+    if (!this._indexManager) return null;
+    return this._indexManager.getIndex(nameOrColumns);
+  }
+
+  static from(data: RowObject[] | Record<string, any[]>, options?: DataFrameOptions): DataFrame {
     if (Array.isArray(data)) {
-      return DataFrame.fromRows(data);
+      return DataFrame.fromRows(data, options);
     } else {
-      return DataFrame.fromColumns(data);
+      return DataFrame.fromColumns(data, options);
     }
   }
 
-  static fromRows(rows: RowObject[]): DataFrame {
+  static fromRows(rows: RowObject[], options?: DataFrameOptions): DataFrame {
     if (rows.length === 0) {
       return new DataFrame({});
     }
-    
+
     const columnNames = Object.keys(rows[0]);
     const columns: Record<string, Column> = {};
-    
+
     columnNames.forEach(name => {
       const values = rows.map(row => row[name]);
       columns[name] = new Column(name, values);
     });
-    
-    return new DataFrame(columns);
+
+    const df = new DataFrame(columns);
+    return DataFrame.applyOptions(df, options);
   }
 
-  static fromColumns(data: Record<string, any[]>): DataFrame {
+  static fromColumns(data: Record<string, any[]>, options?: DataFrameOptions): DataFrame {
     const columns: Record<string, Column> = {};
-    
+
     Object.entries(data).forEach(([name, values]) => {
       columns[name] = new Column(name, values);
     });
-    
-    return new DataFrame(columns);
+
+    const df = new DataFrame(columns);
+    return DataFrame.applyOptions(df, options);
+  }
+
+  /**
+   * Apply options (like indices) to a DataFrame.
+   * @internal
+   */
+  private static applyOptions(df: DataFrame, options?: DataFrameOptions): DataFrame {
+    if (options?.indices) {
+      for (const indexSpec of options.indices) {
+        df.createIndex(indexSpec.columns, {
+          type: indexSpec.type,
+          name: indexSpec.name,
+        });
+      }
+    }
+    return df;
   }
 }
