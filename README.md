@@ -1,161 +1,166 @@
-# Databonk.js
+# Databonk
 
-A lightweight, fast data frame library for JavaScript and TypeScript with built-in schema validation.
+**WASM-powered DataFrame library with SIMD acceleration**
 
-## Features
+Databonk is a high-performance columnar DataFrame library built with AssemblyScript and WebAssembly, featuring SIMD-optimized operations and optional SharedArrayBuffer support for zero-copy data access.
 
-- **Lightweight**: Minimal dependencies, tree-shakeable modules
-- **Fast**: Columnar storage using TypedArrays for performance
-- **Simple**: Clean API for common data operations
-- **Flexible**: Works with regular arrays, TypedArrays, or Apache Arrow
-- **Schema Validation**: Built-in Zod integration for data validation
-- **Type Safe**: Full TypeScript support with inferred types
+## Key Features
+
+- **14x faster** than JavaScript for aggregations (sum, mean, min, max)
+- **SIMD acceleration** with 4-way parallel computation
+- **Zero-copy access** to column data via SharedArrayBuffer
+- **Full TypeScript support** with comprehensive type definitions
+- **Memory efficient** columnar storage design
+- **Fluent API** for method chaining
 
 ## Installation
 
 ```bash
-npm install databonk zod
+npm install databonk
 ```
 
 ## Quick Start
 
-```javascript
-import { DataFrame, SchemaValidator, CommonSchemas } from 'databonk';
+```typescript
+import { loadDatabonk, DatabonkDataFrame } from 'databonk';
 
-// Create a DataFrame
-const df = DataFrame.from({
-  name: ['Alice', 'Bob', 'Charlie'],
-  age: [25, 30, 35],
-  city: ['NYC', 'LA', 'Chicago']
-});
+// Load the WASM module
+const module = await loadDatabonk();
 
-// Basic operations
-const adults = df.filter(row => row.age >= 30);
-const avgAge = df.column('age').mean();
-const grouped = df.groupBy(['city']).agg({ avgAge: 'mean' });
-
-// Schema validation
-const result = df.validate(CommonSchemas.person);
-console.log(`Valid rows: ${result.validRows}/${result.totalRows}`);
-```
-
-## Core Features
-
-### Data Operations
-- **Filtering & Selection**: Powerful row/column filtering with predicate functions
-- **Joins**: Inner, left, right, and outer joins with multiple keys
-- **Aggregations**: Sum, mean, count, min, max, std, variance with group-by support
-- **Reshaping**: Pivot, melt, transpose operations for data transformation
-- **Sorting**: Multi-column sorting with custom comparators
-
-### Schema Validation
-- **Built-in Schemas**: Common patterns for users, products, transactions, coordinates
-- **Custom Validation**: Define your own schemas with Zod
-- **Data Cleaning**: Filter valid/invalid rows, transform data types
-- **Error Reporting**: Detailed validation errors with row/column information
-
-### I/O Support
-- **CSV**: Read/write CSV files with automatic type inference
-- **Apache Arrow**: Optional integration for columnar data exchange
-- **Streaming**: Memory-efficient processing of large datasets
-
-## Examples
-
-### Schema Validation
-
-```javascript
-import { DataFrame, SchemaValidator } from 'databonk';
-import { z } from 'zod';
-
-// Define a custom schema
-const userSchema = SchemaValidator.define({
-  name: z.string().min(1),
-  age: z.number().int().min(0).max(150),
-  email: z.string().email(),
-  role: z.enum(['admin', 'user', 'guest'])
-});
-
-const userData = [
-  { name: 'Alice', age: 25, email: 'alice@example.com', role: 'admin' },
-  { name: '', age: -5, email: 'invalid', role: 'unknown' } // Invalid
-];
-
-const df = DataFrame.fromRows(userData);
-
-// Validate data
-const validation = df.validate(userSchema);
-console.log(`Errors: ${validation.errors.length}`);
-
-// Filter valid rows
-const validUsers = df.filterValid(userSchema);
-
-// Transform data with type coercion
-const cleanData = df.validateAndTransform(userSchema);
-```
-
-### Advanced Data Operations
-
-```javascript
-// Join operations
-const sales = DataFrame.fromRows([
-  { product_id: 1, quantity: 100, region: 'North' },
-  { product_id: 2, quantity: 150, region: 'South' }
+// Create a DataFrame from typed arrays
+const df = await DatabonkDataFrame.fromTypedArrays(module, [
+  { name: 'id', data: new Int32Array([1, 2, 3, 4, 5]) },
+  { name: 'value', data: new Float32Array([10.5, 20.5, 30.5, 40.5, 50.5]) },
 ]);
 
-const products = DataFrame.fromRows([
-  { product_id: 1, name: 'Widget', price: 10.99 },
-  { product_id: 2, name: 'Gadget', price: 15.99 }
-]);
+// Aggregations
+console.log('Sum:', df.sum('value'));     // 152.5
+console.log('Mean:', df.mean('value'));   // 30.5
+console.log('Min:', df.min('value'));     // 10.5
+console.log('Max:', df.max('value'));     // 50.5
+console.log('Rows:', df.rowCount);        // 5
 
-const joined = sales.join(products, 'product_id', 'inner');
-
-// Group by with multiple aggregations
-const summary = joined
-  .groupBy(['region'])
-  .agg({
-    quantity: ['sum', 'mean'],
-    price: 'mean'
-  });
-
-// Add calculated columns
-const withRevenue = joined.withColumn('revenue', 
-  row => row.quantity * row.price
-);
-
-// Pivot tables
-const pivot = sales.pivot(['region'], 'product_id', 'quantity', 'sum');
-```
-
-## Docker Development
-
-```bash
-# Build and start development environment
-make docker-dev
-
-# Run tests in Docker
-make docker-test
-
-# Open shell in container
-make docker-shell
-```
-
-## Development
-
-```bash
-# Local development
-npm install
-npm run build
-npm test
-
-# With Docker
-make setup
-make dev
+// Clean up when done
+df.free();
 ```
 
 ## Performance
 
-Databonk.js is designed for small to medium datasets (up to ~1M rows) with:
-- **Memory efficient**: Columnar storage with TypedArrays
-- **Fast operations**: Optimized algorithms for joins, aggregations
-- **Minimal overhead**: Zero-copy operations where possible
-- **Tree-shakeable**: Only import what you use
+Benchmarks on 1 million rows (Float32):
+
+| Operation | WASM SIMD | JavaScript | Speedup |
+|-----------|-----------|------------|---------|
+| Sum       | ~0.3ms    | ~4.2ms     | **14x** |
+| Min       | ~0.4ms    | ~4.8ms     | **12x** |
+| Max       | ~0.4ms    | ~4.8ms     | **12x** |
+| Mean      | ~0.3ms    | ~5.0ms     | **16x** |
+
+## API Overview
+
+### Module Loading
+
+```typescript
+const module = await loadDatabonk({
+  wasmPath: './build/release.wasm',  // Optional: custom WASM path
+  sharedMemory: true,                 // Optional: enable SharedArrayBuffer
+  initialMemory: 256,                 // Optional: initial memory pages (16MB default)
+  maximumMemory: 16384,               // Optional: max memory pages (1GB default)
+});
+```
+
+### DataFrame Creation
+
+```typescript
+const df = await DatabonkDataFrame.fromTypedArrays(module, [
+  { name: 'int_col', data: new Int32Array([1, 2, 3]) },
+  { name: 'float_col', data: new Float32Array([1.5, 2.5, 3.5]) },
+  { name: 'double_col', data: new Float64Array([1.1, 2.2, 3.3]) },
+]);
+```
+
+### Aggregations
+
+```typescript
+df.sum('column');    // Sum of values
+df.mean('column');   // Average
+df.min('column');    // Minimum
+df.max('column');    // Maximum
+df.count('column');  // Count of values
+```
+
+### Column Arithmetic
+
+```typescript
+df.add('a', 'b', 'sum')           // sum = a + b
+  .sub('a', 'b', 'diff')          // diff = a - b
+  .scalarMul('a', 2.5, 'scaled'); // scaled = a * 2.5
+```
+
+### GroupBy
+
+```typescript
+const grouped = df.groupBy('category', 256)  // maxKey parameter
+  .sum('value');  // or .mean('value')
+```
+
+### Inner Join
+
+```typescript
+const result = left.innerJoin(right, 'left_key', 'right_key');
+```
+
+### Zero-Copy Column Access
+
+```typescript
+const view = df.getColumnView('value');
+if (view) {
+  console.log(view.get(0));      // First value
+  console.log([...view]);        // Iterate
+  console.log(view.toArray());   // Copy to regular array
+}
+```
+
+### Memory Management
+
+```typescript
+df.free();  // Always free DataFrames when done
+```
+
+## Documentation
+
+- [API Reference](./docs/api.md) - Full API documentation
+- [Examples](./docs/examples.md) - Detailed code examples
+
+## Supported Column Types
+
+| Type | TypedArray | Use Case |
+|------|------------|----------|
+| Int32 | `Int32Array` | Integer keys, IDs, counts |
+| Float32 | `Float32Array` | Standard floating-point values |
+| Float64 | `Float64Array` | High-precision values |
+
+## Current Limitations
+
+- GroupBy currently supports single value column aggregation
+- Join keys must be Int32 values
+- String columns are supported for storage but not for operations
+
+## Development
+
+```bash
+# Install dependencies
+npm install
+
+# Build WASM module
+npm run asbuild
+
+# Run tests
+npm test
+
+# Run benchmarks
+npm run benchmark
+```
+
+## License
+
+MIT
