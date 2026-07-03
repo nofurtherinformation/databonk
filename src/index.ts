@@ -1,46 +1,27 @@
 /**
- * Databonk - High-performance DataFrame library
- *
- * A DataFrame library built with AssemblyScript and WASM,
- * featuring SIMD acceleration and SharedArrayBuffer support
- * for zero-copy data access.
+ * dataframe — columnar WASM dataframe library
  */
 
-export { loadDatabonk, isSharedArrayBufferSupported } from './loader';
-export type { DatabonkModule, DatabonkWasm, LoaderOptions } from './loader';
+// Phase 1 — memory core: wasm loader, arena allocator, viewOf() layer.
+export * from './memory/index.js';
 
-export { DatabonkDataFrame, GroupByBuilder } from './dataframe';
-export type { ColumnSpec } from './dataframe';
+// Phase 3 — expression AST + compiler (P3.1).
+export * from './expr/index.js';
 
-export { ColumnType, ColumnView, getColumnTypeSize, createTypedArrayView, allocateAndCopy, copyToWasm, createSharedView } from './shared-memory';
+// Phase 3 — DataFrame / Series / GroupBy / join API (P3.2).
+export * from './frame/index.js';
 
-/**
- * Quick start example:
- *
- * ```typescript
- * import { loadDatabonk, DatabonkDataFrame } from 'databonk';
- *
- * // Load the WASM module
- * const module = await loadDatabonk();
- *
- * // Create a DataFrame from typed arrays
- * const df = await DatabonkDataFrame.fromTypedArrays(module, [
- *   { name: 'id', data: new Int32Array([1, 2, 3, 4, 5]) },
- *   { name: 'value', data: new Float32Array([1.5, 2.5, 3.5, 4.5, 5.5]) },
- * ]);
- *
- * // Aggregations
- * console.log('Sum:', df.sum('value'));
- * console.log('Mean:', df.mean('value'));
- *
- * // Column math
- * df.scalarMul('value', 2.0, 'doubled');
- *
- * // Zero-copy column access
- * const view = df.getColumnView('value');
- * console.log('First value:', view?.get(0));
- *
- * // Cleanup
- * df.free();
- * ```
- */
+// Phase 5 — opt-in parallel mode (ADR-006) lives in the "databonk/workers" subpath
+// export (separate bundle entry) to keep the main entry inside the §1 size budget.
+// Type-only re-exports are free:
+export type { ThreadsConfig, ThreadsHandle } from './workers/index.js';
+
+// Phase 6 — I/O: CSV reader, JSON wrappers, Arrow IPC (P6.E).
+export * from './io/index.js';
+
+export const VERSION = '0.2.0';
+
+/** Returns a greeting string. Placeholder retained for the scaffold smoke test. */
+export function hello(name = 'world'): string {
+  return `Hello, ${name}! dataframe v${VERSION}`;
+}
