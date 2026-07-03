@@ -201,6 +201,18 @@ interface Dictionary {
  */
 declare function writeDictionary(ctx: MemoryContext, uniques: readonly string[]): Dictionary;
 /**
+ * Write a dictionary directly from raw UTF-8 bytes and Arrow-style offsets —
+ * no JS string decode or encode (ABI §12 ingest note, ADR-002).
+ *
+ * `rawOffsets[k]..rawOffsets[k+1]` is the byte range of string `k` in
+ * `rawBytes`; both arrays are already in our dictionaries' layout. This is a
+ * pure bulk-copy: O(count + bytesLen), zero TextDecoder/TextEncoder calls.
+ *
+ * Allocates both wasm buffers before taking any view so a grow between the two
+ * allocs cannot detach a live TypedArray (ADR-001).
+ */
+declare function writeDictionaryFromRawBytes(ctx: MemoryContext, rawBytes: Uint8Array, rawOffsets: Int32Array, count: number): Dictionary;
+/**
  * Decode dictionary slot `slot` to a string, memoized (ADR-002). First call for a
  * slot reads its UTF-8 bytes across the boundary (a *miss*); later calls reuse the
  * cached string (a *hit*). `slot` must be in `[0, dict.count)`.
@@ -346,6 +358,8 @@ declare function freeColumn(ctx: MemoryContext, col: Column): void;
 type ArithOp = 'add' | 'sub' | 'mul' | 'div' | 'mod';
 /** dt accessor field names (dtypes.md §10, ADR-010). */
 type DtComponent = 'year' | 'month' | 'day' | 'hour' | 'minute' | 'second' | 'millisecond' | 'weekday' | 'dayOfYear' | 'quarter';
+/** str namespace op names (dtypes.md §13). v1 has only 'slice'. */
+type StrOp = 'slice';
 /** Comparison operators → boolean/mask (dtypes.md §4.1). */
 type CompareOp = 'gt' | 'ge' | 'lt' | 'le' | 'eq' | 'ne';
 /** Short-circuit-free three-valued boolean operators (dtypes.md §4.2). */
@@ -404,6 +418,16 @@ type ExprNode = Readonly<{
     kind: 'dt';
     component: DtComponent;
     operand: Expr;
+}>
+/**
+ * str.slice: substring via JS String.prototype.slice semantics (dtypes.md §13).
+ * Applied to dictionary values once (O(unique)), then indices remapped (O(rows)).
+ */
+ | Readonly<{
+    kind: 'strSlice';
+    operand: Expr;
+    start: number;
+    end: number | undefined;
 }>;
 /** Anything accepted where an expression operand is expected. Raw scalars wrap to `lit`. */
 type ExprLike = Expr | ScalarValue;
@@ -455,6 +479,12 @@ declare class Expr {
      * Each method returns an `i32` Expr.
      */
     get dt(): DtProxy;
+    /**
+     * str namespace for `utf8` columns (dtypes.md §13).
+     * Returns a {@link StrProxy} with `.slice(start, end?)`.
+     * Throws a dtype error at compile time if the column is not `utf8`.
+     */
+    get str(): StrProxy;
     /** Readable, unambiguous rendering for `console.log` / error messages. */
     toString(): string;
 }
@@ -475,6 +505,30 @@ declare class DtProxy {
     weekday(): Expr;
     dayOfYear(): Expr;
     quarter(): Expr;
+}
+/**
+ * str accessor proxy returned by `Expr.str`. Provides string operations over
+ * `utf8` columns; dtypes.md §13. A dtype error is raised at compile time (not
+ * here) if the parent expression is not `utf8`.
+ */
+declare class StrProxy {
+    private readonly operand;
+    constructor(operand: Expr);
+    /**
+     * Substring via `JS String.prototype.slice` semantics (dtypes.md §13).
+     *
+     * - Negative `start`/`end`: count from the end of the string.
+     * - `end` omitted: slice to the end of the string.
+     * - Out-of-range indices clamp (same as JS).
+     * - Null rows propagate null.
+     * - UTF-16 code-unit indexing (same as every JS string API).
+     *   **Surrogate-pair caveat:** a supplementary character (emoji, CJK extension, etc.)
+     *   occupies two code units; `slice` may split a surrogate pair, producing an
+     *   unpaired surrogate (well-defined but unusual in JS, not valid UTF-8).
+     *   If you need grapheme-cluster or codepoint semantics, pre-process with JS before
+     *   loading into the frame.
+     */
+    slice(start: number, end?: number): Expr;
 }
 /** Reference the frame column named `name`. */
 declare function col(name: string): Expr;
@@ -578,6 +632,14 @@ type TExpr = Readonly<{
     component: DtComponent;
     dtype: 'i32';
     operand: TExpr;
+}>
+/** str.slice: substring on dictionary values (result dtype = 'utf8', dtypes.md §13). */
+ | Readonly<{
+    kind: 'strSlice';
+    dtype: 'utf8';
+    operand: TExpr;
+    start: number;
+    end: number | undefined;
 }>;
 /** Resolve `expr` against `schema`, returning the typed IR. Throws {@link ExprError}. */
 declare function resolve(expr: Expr, schema: Schema): TExpr;
@@ -670,6 +732,14 @@ interface HashExports {
     hash_f32(data: number, vp: number, outHash: number, len: number): void;
     /** `hash_i64(data, vp, out_hash, len) -> ()` — v2.3 i64 column hash. */
     hash_i64(data: number, vp: number, outHash: number, len: number): void;
+    /**
+     * `hash_utf8_dict(offsets_ptr, bytes_ptr, dict_count, out_hash_ptr) -> ()` — ABI §12.
+     *
+     * For each dictionary slot `k in 0..dict_count`, hashes the raw UTF-8 bytes
+     * `bytes[offsets[k]..offsets[k+1])` into `out_hash[k]` (i64).  No row validity
+     * is involved; row nullness is handled separately by the join validity bitmaps.
+     */
+    hash_utf8_dict(offsetsPtr: number, bytesPtr: number, dictCount: number, outHashPtr: number): void;
     /** `hash_combine(acc_hash, add_hash, len) -> ()` — in-place multi-key mix. */
     hash_combine(accHash: number, addHash: number, len: number): void;
     /**
@@ -733,6 +803,31 @@ declare class SeriesDtProxy {
     dayOfYear(): Series;
     quarter(): Series;
 }
+/**
+ * Series.str accessor proxy. Returned by `series.str`; provides string operations
+ * over `utf8` columns (dtypes.md §13). Throws TypeError if the column is not utf8.
+ */
+declare class SeriesStrProxy {
+    private readonly series;
+    constructor(series: Series);
+    /**
+     * Substring via `JS String.prototype.slice` semantics (dtypes.md §13).
+     *
+     * - Negative `start`/`end`: count from the end of the string.
+     * - `end` omitted: slice to the end of the string.
+     * - Out-of-range indices clamp (same as JS).
+     * - Null rows propagate null; the op never inspects null-row string values.
+     * - UTF-16 code-unit indexing.
+     *   **Surrogate-pair caveat:** a supplementary character occupies two code units;
+     *   `slice` may split a surrogate pair (well-defined in JS, unusual in UTF-8).
+     *
+     * Implementation: applied to dictionary values once (O(unique)), then indices
+     * remapped (O(rows)) — no per-row string work.
+     *
+     * Returns a new `utf8` Series.
+     */
+    slice(start: number, end?: number): Series;
+}
 declare class Series {
     readonly name: string;
     readonly dtype: DType;
@@ -750,6 +845,12 @@ declare class Series {
      * Throws TypeError for disallowed fields (e.g. hour on date32).
      */
     get dt(): SeriesDtProxy;
+    /**
+     * str accessor namespace for `utf8` columns (dtypes.md §13).
+     * Returns a {@link SeriesStrProxy} with string methods.
+     * Throws TypeError if the column is not `utf8`.
+     */
+    get str(): SeriesStrProxy;
     [Symbol.iterator](): IterableIterator<Cell>;
     toString(): string;
 }
@@ -796,10 +897,12 @@ declare class GroupBy {
 
 /**
  * Hash join (spec §4; ADR-005). Builds on the right, probes left, via `join_hash_inner`/
- * `join_hash_left` (ABI §9 D; left emits r_idx=-1 → nulls). utf8 keys are dictionary-unified
- * (JS unifyDictionaries) so equal strings across frames share a merged index; bool widens to
- * i32; a null in any key excludes the row. Output = all left columns + right non-key columns
- * (colliding right names suffixed _right).
+ * `join_hash_left` (ABI §9 D; left emits r_idx=-1 → nulls). utf8 keys use the
+ * unification-free path (ABI §12): each side's dictionary bytes are hashed once via
+ * `hash_utf8_dict`, then row hashes are gathered via `gather_i64`; no JS dict unification
+ * is performed. bool widens to i32; a null in any key excludes the row. Output = all left
+ * columns + right non-key columns (colliding right names suffixed _right). Output utf8 key
+ * column reuses the left dictionary (ABI §12).
  */
 
 type JoinHow = 'inner' | 'left';
@@ -851,6 +954,18 @@ declare class DataFrame implements FrameView, GroupBySource {
     static fromColumns(cols: Readonly<Record<string, ColumnInput>>, opts?: FrameOptions): DataFrame;
     static fromRecords(records: ReadonlyArray<Readonly<Record<string, Cell>>>, opts?: FrameOptions): DataFrame;
     private static fromRoots;
+    /**
+     * @internal Adopt pre-built wasm Column objects directly into a DataFrame,
+     * bypassing the JS-array round-trip of {@link fromColumns}. Used by
+     * `fromArrow` for zero-copy column adoption (CP.1 ingest fast path).
+     *
+     * Every column in `named` must have `owned === true` and correct wasm pointers;
+     * ownership transfers to the returned DataFrame (and its OwnedColumn wrappers).
+     */
+    static _adoptColumns(rt: DfRuntime, named: ReadonlyArray<{
+        name: string;
+        col: Column;
+    }>, length: number): DataFrame;
     get shape(): readonly [number, number];
     get columns(): readonly string[];
     get dtypes(): Readonly<Record<string, DType>>;
@@ -883,4 +998,4 @@ declare class DataFrame implements FrameView, GroupBySource {
 }
 declare function scope<T>(fn: (track: <F extends DataFrame>(df: F) => F) => T): T;
 
-export { createMemoryContext as $, type AggName as A, type BoolOp as B, type Column as C, type DType as D, Expr as E, type FrameView as F, GroupBy as G, type SortOptions as H, type TypedArrayCtor as I, type JoinHow as J, type KernelFn as K, type LoadOptions as L, type MemoryContext as M, type NamedColumn as N, type ViewOf as O, type WasmMemoryModule as P, type WithColumnOptions as Q, type Row as R, type ScalarValue as S, type TExpr as T, aggResult as U, type ViewDType as V, type WasmExports as W, callKernel as X, col as Y, columnToArray as Z, createColumn as _, type Cell as a, createViewOf as a0, decodeDictionary as a1, decodeSlot as a2, decodeStats as a3, defaultRuntime as a4, detectSimd as a5, dtypeInfo as a6, freeColumn as a7, freeDictionary as a8, inferType as a9, init as aa, lit as ab, loadRuntime as ac, loadWasmModule as ad, resolve as ae, runtimeFromExports as af, schemaOf as ag, scope as ah, sliceColumn as ai, toExpr as aj, unifyDictionaries as ak, useRuntime as al, writeDictionary as am, type DfRuntime as b, DataFrame as c, type FrameOptions as d, type AggOp as e, type AggRequest as f, type AggSpec as g, type ArithOp as h, type ColumnBuffer as i, type ColumnInput as j, type ColumnView as k, type CompareOp as l, DTYPES as m, type DTypeInfo as n, type DictUnifyResult as o, type Dictionary as p, type ExprLike as q, type ExprNode as r, type FrameWasm as s, type GroupBySource as t, type JoinOptions as u, type JoinSource as v, type KernelWasm as w, type RowCursor as x, type Schema as y, Series as z };
+export { callKernel as $, type AggName as A, type BoolOp as B, type Column as C, type DType as D, Expr as E, type FrameView as F, GroupBy as G, Series as H, SeriesStrProxy as I, type JoinHow as J, type KernelFn as K, type LoadOptions as L, type MemoryContext as M, type NamedColumn as N, type SortOptions as O, type StrOp as P, StrProxy as Q, type Row as R, type ScalarValue as S, type TExpr as T, type TypedArrayCtor as U, type ViewDType as V, type ViewOf as W, type WasmExports as X, type WasmMemoryModule as Y, type WithColumnOptions as Z, aggResult as _, type Cell as a, col as a0, columnToArray as a1, createColumn as a2, createMemoryContext as a3, createViewOf as a4, decodeDictionary as a5, decodeSlot as a6, decodeStats as a7, defaultRuntime as a8, detectSimd as a9, dtypeInfo as aa, freeColumn as ab, freeDictionary as ac, inferType as ad, init as ae, lit as af, loadRuntime as ag, loadWasmModule as ah, resolve as ai, runtimeFromExports as aj, schemaOf as ak, scope as al, sliceColumn as am, toExpr as an, unifyDictionaries as ao, useRuntime as ap, writeDictionary as aq, writeDictionaryFromRawBytes as ar, type DfRuntime as b, DataFrame as c, type FrameOptions as d, type AggOp as e, type AggRequest as f, type AggSpec as g, type ArithOp as h, type ColumnBuffer as i, type ColumnInput as j, type ColumnView as k, type CompareOp as l, DTYPES as m, type DTypeInfo as n, type DictUnifyResult as o, type Dictionary as p, DtProxy as q, type ExprLike as r, type ExprNode as s, type FrameWasm as t, type GroupBySource as u, type JoinOptions as v, type JoinSource as w, type KernelWasm as x, type RowCursor as y, type Schema as z };

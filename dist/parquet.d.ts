@@ -1,4 +1,4 @@
-import { b as DfRuntime, c as DataFrame } from './dataframe-BggBYXYm.js';
+import { b as DfRuntime, c as DataFrame } from './dataframe-Bz1B7bIr.js';
 
 /**
  * databonk/parquet — Parquet I/O subpath export (ADR-011).
